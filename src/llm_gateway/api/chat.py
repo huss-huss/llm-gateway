@@ -8,9 +8,10 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from llm_gateway.config import Target
 from llm_gateway.errors import GatewayHTTPError, error_body
 from llm_gateway.providers.base import ProviderError
-from llm_gateway.router import NoRouteError
+from llm_gateway.router import Attempt, NoRouteError
 from llm_gateway.schemas import ChatCompletionRequest, completion_body, new_completion_id
 from llm_gateway.state import GatewayState
 from llm_gateway.streaming import DONE, StreamAccumulator, encode_stream, sse
@@ -24,12 +25,21 @@ def get_state(request: Request) -> GatewayState:
     return request.app.state.gateway
 
 
+def route_headers(target: Target, attempts: list[Attempt]) -> dict[str, str]:
+    return {
+        "x-gateway-provider": target.provider,
+        "x-gateway-model": target.model,
+        "x-gateway-attempts": str(len(attempts)),
+    }
+
+
 def _to_http(exc: Exception) -> GatewayHTTPError:
     if isinstance(exc, NoRouteError):
         return GatewayHTTPError(404, str(exc), "invalid_request_error", "model_not_found")
     if isinstance(exc, ProviderError):
         type_ = "invalid_request_error" if exc.status_code == 400 else "upstream_error"
-        return GatewayHTTPError(exc.status_code, str(exc), type_, exc.kind)
+        headers = {"retry-after": "1"} if exc.status_code in (429, 503) else None
+        return GatewayHTTPError(exc.status_code, str(exc), type_, exc.kind, headers)
     raise exc
 
 
@@ -61,11 +71,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                 yield sse(error_body(str(exc), "upstream_error", exc.kind))
             yield DONE
 
-        headers = {
-            **SSE_HEADERS,
-            "x-gateway-provider": route.target.provider,
-            "x-gateway-model": route.target.model,
-        }
+        headers = {**SSE_HEADERS, **route_headers(route.target, route.attempts)}
         return StreamingResponse(events(), media_type="text/event-stream", headers=headers)
 
     try:
@@ -73,13 +79,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     except (NoRouteError, ProviderError) as exc:
         raise _to_http(exc) from exc
     payload = completion_body(completion_id=completion_id, model=body.model, resp=result.response)
-    return JSONResponse(
-        payload,
-        headers={
-            "x-gateway-provider": result.target.provider,
-            "x-gateway-model": result.target.model,
-        },
-    )
+    return JSONResponse(payload, headers=route_headers(result.target, result.attempts))
 
 
 @router.get("/v1/models")

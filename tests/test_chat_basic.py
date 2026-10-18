@@ -69,3 +69,13 @@ async def test_list_models(client):
     r = await client.get("/v1/models")
     ids = [m["id"] for m in r.json()["data"]]
     assert {"fast", "smart", "fake/fake-fast"} <= set(ids)
+
+
+async def test_fallback_is_visible_in_headers(client):
+    r = await client.post(
+        "/v1/chat/completions",
+        json={"model": "resilient", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200
+    assert r.headers["x-gateway-model"] == "fake-ok"
+    assert r.headers["x-gateway-attempts"] == "3"  # 2 tries on fail-500, then fallback

@@ -27,7 +27,11 @@ BASE_CONFIG: dict[str, Any] = {
             "slow_s": 5,
         },
     },
-    "aliases": {"fast": ["fake/fake-fast"], "smart": ["fake/fake-smart"]},
+    "aliases": {
+        "fast": ["fake/fake-fast"],
+        "smart": ["fake/fake-smart"],
+        "resilient": ["fake/fail-500", "fake/fake-ok"],
+    },
     "routing": {"retries": 1, "backoff_base_s": 0, "backoff_max_s": 0},
 }
 
