@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from llm_gateway.config import GatewayConfig, Target
 from llm_gateway.providers.base import Provider, ProviderError
-from llm_gateway.schemas import ChatCompletionRequest, ProviderResponse
+from llm_gateway.schemas import ChatCompletionRequest, ProviderResponse, StreamDelta
 
 
 class NoRouteError(Exception):
@@ -17,6 +18,19 @@ class NoRouteError(Exception):
 class RouteResult:
     target: Target
     response: ProviderResponse
+
+
+@dataclass
+class StreamRoute:
+    target: Target
+    deltas: AsyncIterator[StreamDelta]
+
+
+async def _prepend(first: StreamDelta | None, rest: AsyncIterator[StreamDelta]):
+    if first is not None:
+        yield first
+    async for d in rest:
+        yield d
 
 
 class Router:
@@ -37,3 +51,14 @@ class Router:
         except ProviderError:
             raise
         return RouteResult(target, resp)
+
+    async def open_stream(self, req: ChatCompletionRequest) -> StreamRoute:
+        """Start a stream. The first delta is pulled eagerly so connection/HTTP errors surface
+        here (where we can still fall back) rather than after the client saw a 200."""
+        target = self.targets(req.model)[0]
+        it = aiter(self.providers[target.provider].stream(req, target.model))
+        try:
+            first = await anext(it)
+        except StopAsyncIteration:
+            first = None
+        return StreamRoute(target, _prepend(first, it))

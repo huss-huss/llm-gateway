@@ -3,35 +3,76 @@
 from __future__ import annotations
 
 import time
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from llm_gateway.errors import GatewayHTTPError
+from llm_gateway.errors import GatewayHTTPError, error_body
 from llm_gateway.providers.base import ProviderError
 from llm_gateway.router import NoRouteError
 from llm_gateway.schemas import ChatCompletionRequest, completion_body, new_completion_id
 from llm_gateway.state import GatewayState
+from llm_gateway.streaming import DONE, StreamAccumulator, encode_stream, sse
 
 router = APIRouter()
+
+SSE_HEADERS = {"cache-control": "no-cache", "x-accel-buffering": "no"}
 
 
 def get_state(request: Request) -> GatewayState:
     return request.app.state.gateway
 
 
+def _to_http(exc: Exception) -> GatewayHTTPError:
+    if isinstance(exc, NoRouteError):
+        return GatewayHTTPError(404, str(exc), "invalid_request_error", "model_not_found")
+    if isinstance(exc, ProviderError):
+        type_ = "invalid_request_error" if exc.status_code == 400 else "upstream_error"
+        return GatewayHTTPError(exc.status_code, str(exc), type_, exc.kind)
+    raise exc
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request):
     state = get_state(request)
+    completion_id = new_completion_id()
+
+    if body.stream:
+        try:
+            route = await state.router.open_stream(body)
+        except (NoRouteError, ProviderError) as exc:
+            raise _to_http(exc) from exc
+        include_usage = bool((body.stream_options or {}).get("include_usage"))
+        acc = StreamAccumulator()
+
+        async def events() -> AsyncIterator[str]:
+            try:
+                async for line in encode_stream(
+                    route.deltas,
+                    completion_id=completion_id,
+                    model=body.model,
+                    include_usage=include_usage,
+                    acc=acc,
+                ):
+                    yield line
+            except ProviderError as exc:
+                # Headers are already sent; report the failure in-band, as OpenAI does.
+                yield sse(error_body(str(exc), "upstream_error", exc.kind))
+            yield DONE
+
+        headers = {
+            **SSE_HEADERS,
+            "x-gateway-provider": route.target.provider,
+            "x-gateway-model": route.target.model,
+        }
+        return StreamingResponse(events(), media_type="text/event-stream", headers=headers)
+
     try:
         result = await state.router.complete(body)
-    except NoRouteError as exc:
-        raise GatewayHTTPError(404, str(exc), "invalid_request_error", "model_not_found") from exc
-    except ProviderError as exc:
-        raise GatewayHTTPError(exc.status_code, str(exc), "upstream_error", exc.kind) from exc
-    payload = completion_body(
-        completion_id=new_completion_id(), model=body.model, resp=result.response
-    )
+    except (NoRouteError, ProviderError) as exc:
+        raise _to_http(exc) from exc
+    payload = completion_body(completion_id=completion_id, model=body.model, resp=result.response)
     return JSONResponse(
         payload,
         headers={
