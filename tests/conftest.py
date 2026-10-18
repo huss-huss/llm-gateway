@@ -44,9 +44,12 @@ BASE_CONFIG: dict[str, Any] = {
 def settings(tmp_path: Path) -> Settings:
     import os
 
+    # Defaults need no services: SQLite in tmp_path and an in-process fakeredis.
+    # Set TEST_DATABASE_URL / TEST_REDIS_URL to run against real Postgres / Redis.
     db_url = os.environ.get("TEST_DATABASE_URL") or f"sqlite+aiosqlite:///{tmp_path}/test.db"
     return Settings(
         _env_file=None,
+        redis_url=os.environ.get("TEST_REDIS_URL", "memory://"),
         models_path=str(ROOT / "config" / "models.yaml"),
         database_url=db_url,
         admin_key="test-admin-key",
@@ -62,6 +65,7 @@ def gateway_config() -> GatewayConfig:
 @pytest.fixture
 async def state(settings: Settings, gateway_config: GatewayConfig) -> AsyncIterator[GatewayState]:
     st = await build_state(settings, gateway_config)
+    await st.redis.flushdb()
     async with st.engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)

@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv .venv --python 3.12
+      - run: uv pip install --python .venv/bin/python -e ".[dev]"
+      - run: .venv/bin/ruff check .
+      - run: .venv/bin/ruff format --check .
+
+  test:
+    name: test (sqlite + fakeredis)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv .venv --python 3.12
+      - run: uv pip install --python .venv/bin/python -e ".[dev]"
+      - run: .venv/bin/pytest -q
+      - name: eval suite on the fake provider
+        env:
+          GATEWAY_DATABASE_URL: sqlite+aiosqlite:///./ci-evals.db
+          GATEWAY_LOG_LEVEL: WARNING
+        run: |
+          .venv/bin/llm-gateway db upgrade
+          .venv/bin/llm-gateway eval run evals/suite.yaml --model fast --min-pass-rate 0.8
+
+  test-services:
+    name: test (postgres + redis)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: llm_gateway_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7.4-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/llm_gateway_test
+      TEST_REDIS_URL: redis://localhost:6379/15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv .venv --python 3.12
+      - run: uv pip install --python .venv/bin/python -e ".[dev]"
+      - name: migrations apply cleanly and match the models
+        run: |
+          .venv/bin/llm-gateway db upgrade --url "$TEST_DATABASE_URL"
+          .venv/bin/python -c "from alembic import command; from alembic.config import Config; from llm_gateway.cli import migrations_dir; import os; c = Config(); c.set_main_option('script_location', str(migrations_dir())); c.set_main_option('sqlalchemy.url', os.environ['TEST_DATABASE_URL']); c.attributes['configure_logger'] = False; command.check(c)"
+      - run: .venv/bin/pytest -q

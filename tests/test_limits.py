@@ -10,7 +10,6 @@ from llm_gateway.auth import AuthContext
 from llm_gateway.budget import BudgetTracker
 from llm_gateway.db.models import UsageEvent
 from llm_gateway.ratelimit import RateLimiter
-from llm_gateway.redis_client import make_redis
 
 CHAT = {"model": "fast", "messages": [{"role": "user", "content": "capital of France?"}]}
 
@@ -23,8 +22,8 @@ class Clock:
         return self.t
 
 
-async def test_token_bucket_allows_burst_then_refills():
-    redis = make_redis("memory://")
+async def test_token_bucket_allows_burst_then_refills(state):
+    redis = state.redis
     clock = Clock()
     limiter = RateLimiter(redis, clock=clock)
     decisions = [await limiter.hit("k", rpm=3) for _ in range(4)]
@@ -36,7 +35,6 @@ async def test_token_bucket_allows_burst_then_refills():
     assert not (await limiter.hit("k", rpm=3)).allowed
     # Buckets are independent per key.
     assert (await limiter.hit("other", rpm=3)).allowed
-    await redis.aclose()
 
 
 async def test_rate_limit_enforced_over_http(state, anon_client):
