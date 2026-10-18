@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -10,6 +11,8 @@ from llm_gateway.app import create_app
 from llm_gateway.config import GatewayConfig
 from llm_gateway.settings import Settings
 from llm_gateway.state import GatewayState, build_state
+
+ROOT = Path(__file__).resolve().parents[1]
 
 BASE_CONFIG: dict[str, Any] = {
     "defaults": {"max_tokens": 256, "timeout_s": 2},
@@ -38,7 +41,7 @@ BASE_CONFIG: dict[str, Any] = {
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings(_env_file=None)
+    return Settings(_env_file=None, models_path=str(ROOT / "config" / "models.yaml"))
 
 
 @pytest.fixture

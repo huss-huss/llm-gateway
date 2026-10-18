@@ -79,3 +79,13 @@ async def test_fallback_is_visible_in_headers(client):
     assert r.status_code == 200
     assert r.headers["x-gateway-model"] == "fake-ok"
     assert r.headers["x-gateway-attempts"] == "3"  # 2 tries on fail-500, then fallback
+
+
+async def test_cost_header(client):
+    r = await client.post(
+        "/v1/chat/completions",
+        json={"model": "fast", "messages": [{"role": "user", "content": "capital of France?"}]},
+    )
+    usage = r.json()["usage"]
+    expected = (usage["prompt_tokens"] * 0.5 + usage["completion_tokens"] * 1.5) / 1e6
+    assert float(r.headers["x-gateway-cost-usd"]) == round(expected, 8)

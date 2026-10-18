@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from llm_gateway.catalog import Catalog, load_catalog
 from llm_gateway.config import GatewayConfig, load_gateway_config
 from llm_gateway.providers import build_provider
 from llm_gateway.providers.base import Provider
@@ -15,6 +16,7 @@ from llm_gateway.settings import Settings
 class GatewayState:
     settings: Settings
     config: GatewayConfig
+    catalog: Catalog
     providers: dict[str, Provider]
     router: Router
 
@@ -23,9 +25,10 @@ class GatewayState:
             await provider.aclose()
 
 
-def build_providers(config: GatewayConfig) -> dict[str, Provider]:
+def build_providers(config: GatewayConfig, catalog: Catalog | None = None) -> dict[str, Provider]:
+    catalog = catalog or Catalog()
     return {
-        name: build_provider(name, cfg)
+        name: build_provider(name, cfg, catalog)
         for name, cfg in config.providers.items()
         if config.provider_enabled(name)
     }
@@ -33,7 +36,12 @@ def build_providers(config: GatewayConfig) -> dict[str, Provider]:
 
 async def build_state(settings: Settings, config: GatewayConfig | None = None) -> GatewayState:
     config = config or load_gateway_config(settings.config_path)
-    providers = build_providers(config)
+    catalog = load_catalog(settings.models_path)
+    providers = build_providers(config, catalog)
     return GatewayState(
-        settings=settings, config=config, providers=providers, router=Router(config, providers)
+        settings=settings,
+        config=config,
+        catalog=catalog,
+        providers=providers,
+        router=Router(config, providers),
     )

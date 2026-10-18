@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from typing import Any
 
+from llm_gateway.catalog import Catalog
 from llm_gateway.schemas import ChatCompletionRequest, ProviderResponse, StreamDelta
 
 
@@ -96,6 +97,10 @@ class Provider(ABC):
     def __init__(self, name: str, config: dict[str, Any]) -> None:
         self.name = name
         self.config = config
+        self.catalog = Catalog()  # replaced by the factory; adapters read capability flags
+
+    def capability(self, model: str, name: str, default: Any = None) -> Any:
+        return self.catalog.capability(f"{self.name}/{model}", name, default)
 
     @abstractmethod
     async def chat(self, req: ChatCompletionRequest, model: str) -> ProviderResponse: ...

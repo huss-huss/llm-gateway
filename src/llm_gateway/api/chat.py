@@ -79,7 +79,11 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     except (NoRouteError, ProviderError) as exc:
         raise _to_http(exc) from exc
     payload = completion_body(completion_id=completion_id, model=body.model, resp=result.response)
-    return JSONResponse(payload, headers=route_headers(result.target, result.attempts))
+    headers = route_headers(result.target, result.attempts)
+    cost = state.catalog.cost(result.target.id, result.response.usage)
+    if cost is not None:
+        headers["x-gateway-cost-usd"] = f"{cost:.8f}"
+    return JSONResponse(payload, headers=headers)
 
 
 @router.get("/v1/models")

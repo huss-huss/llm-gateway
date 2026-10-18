@@ -1,0 +1,59 @@
+# Model catalog: prices (USD per 1M tokens) and capability flags used by the adapters.
+#
+# as_of: 2026-10-18
+# Sources:
+#   anthropic/*  Anthropic Claude API model/pricing table (via the claude-api reference,
+#                cached 2026-10-06). https://platform.claude.com/docs/en/about-claude/pricing
+#   openai/*     OpenAI API pricing page (https://openai.com/api/pricing) as last verified by
+#                the author; OpenAI changes prices and models often - re-check before relying.
+#   fake/*       Made-up non-zero prices so demos and evals exercise cost accounting.
+#   ollama/*     Local inference: $0.
+#
+# Capability flags (Anthropic adapter):
+#   sampling: false            -> temperature/top_p are dropped (these models reject them)
+#   forced_tool_choice: false  -> tool_choice "required"/named tool is sent as "auto"
+#   server_fallback: true      -> send `fallbacks: "default"` (beta) so a safety-classifier
+#                                 refusal is retried server-side on a recommended model
+as_of: "2026-10-18"
+
+models:
+  anthropic/claude-opus-5-5:
+    input: 4.00
+    output: 20.00
+    cache_read: 0.20
+    capabilities: { sampling: false, forced_tool_choice: false, server_fallback: true }
+  anthropic/claude-sonnet-5-5:
+    input: 2.00
+    output: 10.00
+    cache_read: 0.20
+    capabilities: { sampling: false, forced_tool_choice: false, server_fallback: true }
+  anthropic/claude-haiku-5-5:
+    input: 0.10
+    output: 0.50
+    # Prompts above 100K tokens are billed at the long-context rate.
+    long_context: { threshold_tokens: 100000, input: 0.50, output: 2.50 }
+    capabilities: { sampling: false, server_fallback: false }
+
+  openai/gpt-4.1:
+    input: 2.00
+    output: 8.00
+    cache_read: 0.50
+  openai/gpt-4.1-mini:
+    input: 0.40
+    output: 1.60
+    cache_read: 0.10
+  openai/gpt-4.1-nano:
+    input: 0.10
+    output: 0.40
+    cache_read: 0.025
+  openai/gpt-4o-mini:
+    input: 0.15
+    output: 0.60
+    cache_read: 0.075
+
+  fake/*:
+    input: 0.50
+    output: 1.50
+  ollama/*:
+    input: 0.0
+    output: 0.0
