@@ -9,8 +9,13 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TypeVar
 
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, Status, StatusCode
+
 from llm_gateway.breaker import CircuitBreaker
 from llm_gateway.config import GatewayConfig, Target
+from llm_gateway.observability import metrics
+from llm_gateway.observability.tracing import tracer
 from llm_gateway.providers.base import Provider, ProviderError, ProviderTimeoutError
 from llm_gateway.schemas import ChatCompletionRequest, ProviderResponse, StreamDelta
 
@@ -85,8 +90,6 @@ class Router:
             name: CircuitBreaker(bc.failure_threshold, bc.cooldown_s, clock=clock)
             for name in providers
         }
-        # Optional hook: called once per provider attempt (used for metrics/tracing).
-        self.on_attempt: Callable[[Target, str, float], None] | None = None
 
     def targets(self, model: str) -> list[Target]:
         targets = [t for t in self.config.resolve(model) if t.provider in self.providers]
@@ -120,21 +123,33 @@ class Router:
                     self._notify(target, "circuit_open", 0.0)
                     break
                 started = time.perf_counter()
-                try:
-                    async with asyncio.timeout(self.timeout_for(target.provider)):
-                        result = await call(provider, target)
-                except TimeoutError:
-                    err: ProviderError = ProviderTimeoutError(
-                        f"{target.id} timed out after {self.timeout_for(target.provider)}s"
-                    )
-                except ProviderError as exc:
-                    err = exc
-                else:
-                    elapsed = time.perf_counter() - started
-                    breaker.record_success()
-                    attempts.append(Attempt(target.id, "ok", elapsed))
-                    self._notify(target, "ok", elapsed)
-                    return target, result, attempts
+                with tracer.start_as_current_span(
+                    "provider.call",
+                    kind=SpanKind.CLIENT,
+                    attributes={
+                        "gen_ai.system": target.provider,
+                        "gen_ai.request.model": target.model,
+                        "llm_gateway.attempt": n + 1,
+                    },
+                ) as span:
+                    try:
+                        async with asyncio.timeout(self.timeout_for(target.provider)):
+                            result = await call(provider, target)
+                    except TimeoutError:
+                        err: ProviderError = ProviderTimeoutError(
+                            f"{target.id} timed out after {self.timeout_for(target.provider)}s"
+                        )
+                    except ProviderError as exc:
+                        err = exc
+                    else:
+                        elapsed = time.perf_counter() - started
+                        breaker.record_success()
+                        span.set_attribute("llm_gateway.outcome", "ok")
+                        attempts.append(Attempt(target.id, "ok", elapsed))
+                        self._notify(target, "ok", elapsed)
+                        return target, result, attempts
+                    span.set_attribute("llm_gateway.outcome", err.kind)
+                    span.set_status(Status(StatusCode.ERROR, str(err)))
                 elapsed = time.perf_counter() - started
                 attempts.append(Attempt(target.id, err.kind, elapsed))
                 self._notify(target, err.kind, elapsed)
@@ -142,6 +157,7 @@ class Router:
                     # The request is at fault, not the provider: fail fast, don't trip breakers.
                     raise err
                 breaker.record_failure()
+                metrics.observe_breaker(target.provider, breaker.state)
                 last = err
                 if not err.retryable or n == retries:
                     break
@@ -149,12 +165,17 @@ class Router:
         raise AllTargetsFailedError(attempts, last)
 
     def _notify(self, target: Target, outcome: str, elapsed: float) -> None:
-        if self.on_attempt is not None:
-            self.on_attempt(target, outcome, elapsed)
+        metrics.observe_attempt(target.provider, target.model, outcome, elapsed)
+        metrics.observe_breaker(target.provider, self.breakers[target.provider].state)
 
     async def complete(self, req: ChatCompletionRequest) -> RouteResult:
         async def call(provider: Provider, target: Target) -> ProviderResponse:
-            return await provider.chat(req, target.model)
+            resp = await provider.chat(req, target.model)
+            span = trace.get_current_span()
+            span.set_attribute("gen_ai.usage.input_tokens", resp.usage.prompt_tokens)
+            span.set_attribute("gen_ai.usage.output_tokens", resp.usage.completion_tokens)
+            span.set_attribute("gen_ai.response.finish_reasons", [resp.finish_reason])
+            return resp
 
         target, resp, attempts = await self._run(req.model, call)
         return RouteResult(target, resp, attempts)
