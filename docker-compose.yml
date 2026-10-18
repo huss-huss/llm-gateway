@@ -1,0 +1,57 @@
+# Gateway + Postgres + Redis. Optional Jaeger for traces:
+#   GATEWAY_OTEL_EXPORTER=otlp docker compose --profile tracing up --build
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: llm_gateway
+      POSTGRES_PASSWORD: llm_gateway
+      POSTGRES_DB: llm_gateway
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llm_gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GATEWAY_DATABASE_URL: postgresql+asyncpg://llm_gateway:llm_gateway@postgres:5432/llm_gateway
+      GATEWAY_REDIS_URL: redis://redis:6379/0
+      GATEWAY_ADMIN_KEY: ${GATEWAY_ADMIN_KEY:?set GATEWAY_ADMIN_KEY in .env}
+      GATEWAY_KEY_PEPPER: ${GATEWAY_KEY_PEPPER:?set GATEWAY_KEY_PEPPER in .env}
+      GATEWAY_OTEL_EXPORTER: ${GATEWAY_OTEL_EXPORTER:-none}
+      GATEWAY_OTEL_ENDPOINT: http://jaeger:4318
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    profiles: ["tracing"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI
+      - "4318:4318"     # OTLP/HTTP
+
+volumes:
+  pgdata:
