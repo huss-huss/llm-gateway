@@ -10,6 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from llm_gateway import __version__
 from llm_gateway.api import chat
 from llm_gateway.errors import GatewayHTTPError, error_response
+from llm_gateway.request_context import RequestIDMiddleware
 from llm_gateway.settings import Settings, get_settings
 from llm_gateway.state import GatewayState, build_state
 
@@ -50,4 +51,5 @@ def create_app(settings: Settings | None = None, state: GatewayState | None = No
         return {"status": "ok", "version": __version__}
 
     app.include_router(chat.router)
+    app.add_middleware(RequestIDMiddleware)
     return app

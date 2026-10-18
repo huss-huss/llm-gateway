@@ -9,6 +9,7 @@ import pytest
 
 from llm_gateway.app import create_app
 from llm_gateway.config import GatewayConfig
+from llm_gateway.db.models import Base
 from llm_gateway.settings import Settings
 from llm_gateway.state import GatewayState, build_state
 
@@ -40,8 +41,17 @@ BASE_CONFIG: dict[str, Any] = {
 
 
 @pytest.fixture
-def settings() -> Settings:
-    return Settings(_env_file=None, models_path=str(ROOT / "config" / "models.yaml"))
+def settings(tmp_path: Path) -> Settings:
+    import os
+
+    db_url = os.environ.get("TEST_DATABASE_URL") or f"sqlite+aiosqlite:///{tmp_path}/test.db"
+    return Settings(
+        _env_file=None,
+        models_path=str(ROOT / "config" / "models.yaml"),
+        database_url=db_url,
+        admin_key="test-admin-key",
+        key_pepper="test-pepper",
+    )
 
 
 @pytest.fixture
@@ -52,13 +62,28 @@ def gateway_config() -> GatewayConfig:
 @pytest.fixture
 async def state(settings: Settings, gateway_config: GatewayConfig) -> AsyncIterator[GatewayState]:
     st = await build_state(settings, gateway_config)
+    async with st.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
     yield st
     await st.aclose()
 
 
 @pytest.fixture
-async def client(settings: Settings, state: GatewayState) -> AsyncIterator[httpx.AsyncClient]:
+async def api_key(state: GatewayState) -> str:
+    raw, _ = await state.keys.create("test", "acme")
+    return raw
+
+
+@pytest.fixture
+async def anon_client(settings: Settings, state: GatewayState) -> AsyncIterator[httpx.AsyncClient]:
     app = create_app(settings, state)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+@pytest.fixture
+async def client(anon_client: httpx.AsyncClient, api_key: str) -> httpx.AsyncClient:
+    anon_client.headers["authorization"] = f"Bearer {api_key}"
+    return anon_client

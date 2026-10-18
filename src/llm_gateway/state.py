@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+
+from llm_gateway.auth import KeyStore
 from llm_gateway.catalog import Catalog, load_catalog
 from llm_gateway.config import GatewayConfig, load_gateway_config
+from llm_gateway.db.session import make_engine, make_sessionmaker
+from llm_gateway.ledger import UsageLedger
 from llm_gateway.providers import build_provider
 from llm_gateway.providers.base import Provider
 from llm_gateway.router import Router
@@ -19,10 +24,15 @@ class GatewayState:
     catalog: Catalog
     providers: dict[str, Provider]
     router: Router
+    engine: AsyncEngine
+    sessionmaker: async_sessionmaker
+    keys: KeyStore
+    ledger: UsageLedger
 
     async def aclose(self) -> None:
         for provider in self.providers.values():
             await provider.aclose()
+        await self.engine.dispose()
 
 
 def build_providers(config: GatewayConfig, catalog: Catalog | None = None) -> dict[str, Provider]:
@@ -44,10 +54,16 @@ async def build_state(settings: Settings, config: GatewayConfig | None = None) -
     config = config or load_gateway_config(settings.config_path)
     catalog = load_catalog(settings.models_path)
     providers = build_providers(config, catalog)
+    engine = make_engine(settings.database_url)
+    sessionmaker = make_sessionmaker(engine)
     return GatewayState(
         settings=settings,
         config=config,
         catalog=catalog,
         providers=providers,
         router=Router(config, providers),
+        engine=engine,
+        sessionmaker=sessionmaker,
+        keys=KeyStore(sessionmaker, settings.key_pepper.get_secret_value()),
+        ledger=UsageLedger(sessionmaker),
     )
