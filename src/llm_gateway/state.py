@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from llm_gateway.auth import KeyStore
 from llm_gateway.budget import BudgetTracker
+from llm_gateway.cache import ResponseCache
 from llm_gateway.catalog import Catalog, load_catalog
 from llm_gateway.config import GatewayConfig, load_gateway_config
 from llm_gateway.db.session import make_engine, make_sessionmaker
@@ -35,6 +36,7 @@ class GatewayState:
     redis: Redis
     limiter: RateLimiter
     budgets: BudgetTracker
+    cache: ResponseCache
 
     async def aclose(self) -> None:
         for provider in self.providers.values():
@@ -78,4 +80,5 @@ async def build_state(settings: Settings, config: GatewayConfig | None = None) -
         redis=redis,
         limiter=RateLimiter(redis),
         budgets=BudgetTracker(redis, sessionmaker),
+        cache=ResponseCache(redis, config.cache.ttl_s, config.cache.enabled),
     )

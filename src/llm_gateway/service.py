@@ -5,11 +5,13 @@ authenticate -> resolve route -> call providers (retry/fallback) -> price -> rec
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
 from llm_gateway.auth import AuthContext
+from llm_gateway.cache import cache_key, is_cacheable
 from llm_gateway.config import Target
 from llm_gateway.errors import GatewayHTTPError, error_body
 from llm_gateway.ledger import UsageRecord
@@ -22,7 +24,7 @@ from llm_gateway.schemas import (
     new_completion_id,
 )
 from llm_gateway.state import GatewayState
-from llm_gateway.streaming import DONE, StreamAccumulator, encode_stream, sse
+from llm_gateway.streaming import DONE, StreamAccumulator, encode_stream, replay, sse
 
 
 @dataclass
@@ -76,6 +78,7 @@ class ChatService:
         resp: ProviderResponse | None = None,
         cost: float | None = None,
         attempts: int = 0,
+        cache_hit: bool = False,
     ) -> UsageRecord:
         usage = resp.usage if resp else None
         return UsageRecord(
@@ -93,6 +96,7 @@ class ChatService:
             cost_usd=cost or 0.0,
             latency_ms=int((time.perf_counter() - started) * 1000),
             attempts=attempts,
+            cache_hit=cache_hit,
         )
 
     async def _fail(
@@ -151,13 +155,53 @@ class ChatService:
             raise await self._fail(exc, ctx, req, rid, started) from exc
         return await self._preflight(ctx, req)
 
+    def _cache_lookup_key(self, ctx: AuthContext, req: ChatCompletionRequest, bypass: bool):
+        cache = self.state.cache
+        if not cache.enabled or not is_cacheable(req):
+            return None, "bypass"
+        return cache_key(ctx.tenant, req), ("refresh" if bypass else "lookup")
+
     # ---------------------------------------------------------------- entry points
 
     async def complete(
-        self, ctx: AuthContext, req: ChatCompletionRequest, request_id: str
+        self,
+        ctx: AuthContext,
+        req: ChatCompletionRequest,
+        request_id: str,
+        *,
+        cache_bypass: bool = False,
     ) -> ChatResult:
         started = time.perf_counter()
-        pre_headers = await self._begin(ctx, req, request_id, started)
+        headers = await self._begin(ctx, req, request_id, started)
+        key, mode = self._cache_lookup_key(ctx, req, cache_bypass)
+
+        if key and mode == "lookup" and (hit := await self.state.cache.get(key)):
+            await self.state.ledger.record(
+                self._record(
+                    ctx=ctx,
+                    req=req,
+                    request_id=request_id,
+                    started=started,
+                    status="ok",
+                    http_status=200,
+                    target=Target(provider=hit.provider, model=hit.model),
+                    cache_hit=True,
+                )
+            )
+            payload = completion_body(
+                completion_id=new_completion_id(), model=req.model, resp=hit.response
+            )
+            headers.update(
+                {
+                    "x-gateway-cache": "hit",
+                    "x-gateway-provider": hit.provider,
+                    "x-gateway-model": hit.model,
+                    "x-gateway-attempts": "0",
+                    "x-gateway-cost-usd": f"{0:.8f}",
+                }
+            )
+            return ChatResult(payload, headers)
+
         try:
             result = await self.state.router.complete(req)
         except (NoRouteError, ProviderError) as exc:
@@ -178,32 +222,57 @@ class ChatService:
                 attempts=len(result.attempts),
             )
         )
+        if key:
+            await self.state.cache.set(
+                key, result.response, result.target.provider, result.target.model
+            )
         payload = completion_body(
             completion_id=new_completion_id(), model=req.model, resp=result.response
         )
-        return ChatResult(
-            payload, {**pre_headers, **self._headers(result.target, result.attempts, cost)}
-        )
+        headers.update(self._headers(result.target, result.attempts, cost))
+        headers["x-gateway-cache"] = "miss" if key else "bypass"
+        return ChatResult(payload, headers)
 
     async def stream(
-        self, ctx: AuthContext, req: ChatCompletionRequest, request_id: str
+        self,
+        ctx: AuthContext,
+        req: ChatCompletionRequest,
+        request_id: str,
+        *,
+        cache_bypass: bool = False,
     ) -> StreamResult:
         started = time.perf_counter()
-        pre_headers = await self._begin(ctx, req, request_id, started)
-        try:
-            route = await self.state.router.open_stream(req)
-        except (NoRouteError, ProviderError) as exc:
-            raise await self._fail(exc, ctx, req, request_id, started) from exc
-
+        headers = await self._begin(ctx, req, request_id, started)
+        key, mode = self._cache_lookup_key(ctx, req, cache_bypass)
         include_usage = bool((req.stream_options or {}).get("include_usage"))
+        catalog, ledger, budgets, cache = (
+            self.state.catalog,
+            self.state.ledger,
+            self.state.budgets,
+            self.state.cache,
+        )
+
+        hit = await cache.get(key) if key and mode == "lookup" else None
+        if hit is not None:
+            target = Target(provider=hit.provider, model=hit.model)
+            attempts: list[Attempt] = []
+            deltas = replay(hit.response)
+            headers["x-gateway-cache"] = "hit"
+        else:
+            try:
+                route = await self.state.router.open_stream(req)
+            except (NoRouteError, ProviderError) as exc:
+                raise await self._fail(exc, ctx, req, request_id, started) from exc
+            target, attempts, deltas = route.target, route.attempts, route.deltas
+            headers["x-gateway-cache"] = "miss" if key else "bypass"
+
         acc = StreamAccumulator()
-        catalog, ledger, budgets = self.state.catalog, self.state.ledger, self.state.budgets
 
         async def events() -> AsyncIterator[str]:
             status, http_status = "ok", 200
             try:
                 async for line in encode_stream(
-                    route.deltas,
+                    deltas,
                     completion_id=new_completion_id(),
                     model=req.model,
                     include_usage=include_usage,
@@ -214,26 +283,44 @@ class ChatService:
                 # Headers are already sent; report the failure in-band, as OpenAI does.
                 status, http_status = exc.kind, exc.status_code
                 yield sse(error_body(str(exc), "upstream_error", exc.kind))
+            except (GeneratorExit, asyncio.CancelledError):
+                status, http_status = "client_closed", 499
+                raise
             finally:
                 resp = acc.response()
-                cost = catalog.cost(route.target.id, resp.usage)
-                await budgets.add(ctx, cost or 0.0)
-                await ledger.record(
-                    self._record(
-                        ctx=ctx,
-                        req=req,
-                        request_id=request_id,
-                        started=started,
-                        status=status,
-                        http_status=http_status,
-                        target=route.target,
-                        resp=resp,
-                        cost=cost,
-                        attempts=len(route.attempts),
+                if hit is not None:
+                    await ledger.record(
+                        self._record(
+                            ctx=ctx,
+                            req=req,
+                            request_id=request_id,
+                            started=started,
+                            status=status,
+                            http_status=http_status,
+                            target=target,
+                            cache_hit=True,
+                        )
                     )
-                )
+                else:
+                    cost = catalog.cost(target.id, resp.usage)
+                    await budgets.add(ctx, cost or 0.0)
+                    await ledger.record(
+                        self._record(
+                            ctx=ctx,
+                            req=req,
+                            request_id=request_id,
+                            started=started,
+                            status=status,
+                            http_status=http_status,
+                            target=target,
+                            resp=resp,
+                            cost=cost,
+                            attempts=len(attempts),
+                        )
+                    )
+                    if key and status == "ok":
+                        await cache.set(key, resp, target.provider, target.model)
             yield DONE
 
-        return StreamResult(
-            events(), {**pre_headers, **self._headers(route.target, route.attempts, None)}
-        )
+        headers.update(self._headers(target, attempts, None))
+        return StreamResult(events(), headers)

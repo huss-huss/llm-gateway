@@ -25,12 +25,14 @@ async def chat_completions(
 ):
     service = ChatService(get_state(request))
     rid = get_request_id(request)
+    # `Cache-Control: no-cache` skips the cache read (the fresh response is still stored).
+    bypass = "no-cache" in request.headers.get("cache-control", "").lower()
     if body.stream:
-        result = await service.stream(ctx, body, rid)
+        result = await service.stream(ctx, body, rid, cache_bypass=bypass)
         return StreamingResponse(
             result.events, media_type="text/event-stream", headers={**SSE_HEADERS, **result.headers}
         )
-    result = await service.complete(ctx, body, rid)
+    result = await service.complete(ctx, body, rid, cache_bypass=bypass)
     return JSONResponse(result.payload, headers=result.headers)
 
 
