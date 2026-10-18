@@ -7,6 +7,26 @@ defaults:
   timeout_s: 60
 
 providers:
+  anthropic:
+    type: anthropic
+    api_key_env: ANTHROPIC_API_KEY    # disabled when unset
+    timeout_s: 60
+    server_fallback: true             # opt in to `fallbacks: "default"` where the catalog allows
+
+  openai:
+    type: openai
+    api_key_env: OPENAI_API_KEY       # disabled when unset
+    base_url: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+    timeout_s: 60
+
+  ollama:
+    type: ollama
+    enabled: ${OLLAMA_ENABLED:-false}
+    base_url: ${OLLAMA_BASE_URL:-http://localhost:11434}
+    timeout_s: 120
+
+  # Deterministic, offline provider. Keeps the quick start and evals working with no keys.
+  # Remove it from the alias chains below in production.
   fake:
     type: fake
     # Deterministic replies used by the quick start and the example eval suite.
@@ -22,8 +42,38 @@ providers:
       - match: "weather"
         reply: "It is sunny in Addis Ababa."
 
+routing:
+  retries: 2            # extra attempts per target on 429 / 5xx / timeout
+  backoff_base_s: 0.25  # exponential, jittered, honours Retry-After (capped)
+  backoff_max_s: 4
+  breaker:
+    failure_threshold: 5
+    cooldown_s: 30
+
+cache:
+  enabled: true
+  ttl_s: 3600           # only temperature=0 requests are cached
+
+# Aliases map a public model name to an ordered fallback chain of provider/model targets.
+# Disabled providers are skipped, so with no API keys every alias resolves to `fake`.
 aliases:
   fast:
+    - anthropic/claude-haiku-5-5
+    - openai/gpt-4.1-mini
+    - ollama/llama3.2
     - fake/fake-fast
   smart:
+    - anthropic/claude-opus-5-5
+    - openai/gpt-4.1
     - fake/fake-smart
+  balanced:
+    - anthropic/claude-sonnet-5-5
+    - openai/gpt-4.1-mini
+    - fake/fake-balanced
+  local:
+    - ollama/llama3.2
+    - fake/fake-local
+  # Demo: the first target always fails, so every request falls back.
+  demo-fallback:
+    - fake/fail-500
+    - fake/fake-fast

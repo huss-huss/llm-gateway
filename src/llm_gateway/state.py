@@ -27,11 +27,17 @@ class GatewayState:
 
 def build_providers(config: GatewayConfig, catalog: Catalog | None = None) -> dict[str, Provider]:
     catalog = catalog or Catalog()
-    return {
-        name: build_provider(name, cfg, catalog)
-        for name, cfg in config.providers.items()
-        if config.provider_enabled(name)
-    }
+    providers: dict[str, Provider] = {}
+    for name, cfg in config.providers.items():
+        if not config.provider_enabled(name):
+            continue
+        merged = {
+            "timeout_s": config.defaults.timeout_s,
+            "default_max_tokens": config.defaults.max_tokens,
+            **cfg,
+        }
+        providers[name] = build_provider(name, merged, catalog)
+    return providers
 
 
 async def build_state(settings: Settings, config: GatewayConfig | None = None) -> GatewayState:

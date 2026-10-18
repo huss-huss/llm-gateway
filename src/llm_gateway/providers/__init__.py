@@ -5,10 +5,18 @@ from __future__ import annotations
 from typing import Any
 
 from llm_gateway.catalog import Catalog
+from llm_gateway.providers.anthropic import AnthropicProvider
 from llm_gateway.providers.base import Provider
 from llm_gateway.providers.fake import FakeProvider
+from llm_gateway.providers.ollama import OllamaProvider
+from llm_gateway.providers.openai import OpenAIProvider
 
-PROVIDER_TYPES: dict[str, type[Provider]] = {"fake": FakeProvider}
+PROVIDER_TYPES: dict[str, type[Provider]] = {
+    "fake": FakeProvider,
+    "openai": OpenAIProvider,
+    "anthropic": AnthropicProvider,
+    "ollama": OllamaProvider,
+}
 
 
 def build_provider(name: str, config: dict[str, Any], catalog: Catalog | None = None) -> Provider:
