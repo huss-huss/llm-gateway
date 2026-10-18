@@ -9,11 +9,13 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
     Numeric,
     String,
+    Text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -77,3 +79,37 @@ class UsageEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )
+
+
+class EvalRun(Base):
+    __tablename__ = "eval_runs"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    suite: Mapped[str] = mapped_column(String(200))
+    model: Mapped[str] = mapped_column(String(200))
+    cases: Mapped[int] = mapped_column(Integer)
+    passed: Mapped[int] = mapped_column(Integer)
+    pass_rate: Mapped[float] = mapped_column(Float)
+    total_cost_usd: Mapped[Decimal] = mapped_column(Money)
+    avg_latency_ms: Mapped[float] = mapped_column(Float)
+    p95_latency_ms: Mapped[float] = mapped_column(Float)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class EvalResult(Base):
+    __tablename__ = "eval_results"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("eval_runs.id", ondelete="CASCADE"), index=True)
+    case_id: Mapped[str] = mapped_column(String(200))
+    passed: Mapped[bool] = mapped_column(Boolean)
+    provider: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    latency_ms: Mapped[int] = mapped_column(Integer)
+    cost_usd: Mapped[Decimal] = mapped_column(Money)
+    prompt_tokens: Mapped[int] = mapped_column(Integer)
+    completion_tokens: Mapped[int] = mapped_column(Integer)
+    output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failures: Mapped[str] = mapped_column(Text)  # JSON list of failure messages
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)

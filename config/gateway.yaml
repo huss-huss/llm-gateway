@@ -29,8 +29,12 @@ providers:
   # Remove it from the alias chains below in production.
   fake:
     type: fake
+    latency_ms: 25   # simulated upstream latency
     # Deterministic replies used by the quick start and the example eval suite.
     rules:
+      # Used as the judge for llm_judge eval assertions (always grades PASS - demo only).
+      - match: "^You are an impartial grader"
+        reply: "PASS"
       - match: "capital of france"
         reply: "The capital of France is Paris."
       - match: "2 \\+ 2|two plus two"

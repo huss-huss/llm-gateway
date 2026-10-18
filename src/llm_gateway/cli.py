@@ -77,6 +77,38 @@ def cmd_keys(args: argparse.Namespace) -> int:
     return asyncio.run(_with_state(run))
 
 
+def cmd_eval(args: argparse.Namespace) -> int:
+    from llm_gateway.evals.runner import EvalRunner, format_report, store_report
+    from llm_gateway.evals.suite import load_suite
+
+    suite = load_suite(args.suite)
+
+    async def run(state):
+        runner = EvalRunner(
+            state.router,
+            state.catalog,
+            judge_model=args.judge_model,
+            concurrency=args.concurrency,
+        )
+        report = await runner.run(suite, args.model)
+        if not args.no_store:
+            await store_report(state.sessionmaker, report)
+        return report
+
+    report = asyncio.run(_with_state(run))
+    if args.json:
+        print(
+            json.dumps(
+                {**report.summary(), "results": [vars(r) for r in report.results]},
+                indent=2,
+                default=str,
+            )
+        )
+    else:
+        print(format_report(report))
+    return 0 if report.pass_rate >= args.min_pass_rate else 1
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -118,6 +150,23 @@ def build_parser() -> argparse.ArgumentParser:
     revoke = keys_sub.add_parser("revoke")
     revoke.add_argument("id", type=int)
     keys.set_defaults(func=cmd_keys)
+
+    ev = sub.add_parser("eval", help="run prompt eval suites")
+    ev_sub = ev.add_subparsers(dest="eval_cmd", required=True)
+    run = ev_sub.add_parser("run", help="run a suite against a model alias")
+    run.add_argument("suite", help="path to a suite YAML file")
+    run.add_argument("--model", required=True, help="alias or provider/model")
+    run.add_argument("--judge-model", default="smart", help="model for llm_judge assertions")
+    run.add_argument("--concurrency", type=int, default=4)
+    run.add_argument("--no-store", action="store_true", help="do not save results to the DB")
+    run.add_argument("--json", action="store_true", help="print machine-readable results")
+    run.add_argument(
+        "--min-pass-rate",
+        type=float,
+        default=0.0,
+        help="exit non-zero below this pass rate (0-1), for CI gates",
+    )
+    run.set_defaults(func=cmd_eval)
     return p
 
 
