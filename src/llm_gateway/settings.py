@@ -33,6 +33,17 @@ class Settings(BaseSettings):
     service_name: str = "llm-gateway"
 
 
+def load_dotenv_file(path: str = ".env") -> None:
+    """Load ``.env`` into the process environment (without overriding real env vars).
+
+    Settings already read ``GATEWAY_*`` from ``.env``; this also exposes provider keys such as
+    ``ANTHROPIC_API_KEY`` that the routing config looks up via ``os.environ``.
+    """
+    from dotenv import load_dotenv
+
+    load_dotenv(path, override=False)
+
+
 @lru_cache
 def get_settings() -> Settings:
     return Settings()

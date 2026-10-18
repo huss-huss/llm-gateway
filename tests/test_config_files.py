@@ -24,3 +24,18 @@ def test_shipped_config_enables_providers_with_keys(monkeypatch):
     monkeypatch.setenv("OLLAMA_ENABLED", "true")
     cfg = load_gateway_config(ROOT / "config" / "gateway.yaml")
     assert set(build_providers(cfg)) == {"anthropic", "openai", "ollama", "fake"}
+
+
+def test_dotenv_exposes_provider_keys(tmp_path, monkeypatch):
+    from llm_gateway.settings import load_dotenv_file
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "from-real-env")
+    env = tmp_path / ".env"
+    env.write_text("ANTHROPIC_API_KEY=from-dotenv\nOPENAI_API_KEY=from-dotenv\n")
+    load_dotenv_file(str(env))
+    import os
+
+    assert os.environ["ANTHROPIC_API_KEY"] == "from-dotenv"
+    assert os.environ["OPENAI_API_KEY"] == "from-real-env"  # real env wins
+    monkeypatch.delenv("ANTHROPIC_API_KEY")

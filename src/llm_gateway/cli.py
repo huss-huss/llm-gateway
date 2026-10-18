@@ -9,7 +9,7 @@ import os
 import sys
 from pathlib import Path
 
-from llm_gateway.settings import Settings
+from llm_gateway.settings import Settings, load_dotenv_file
 
 
 def migrations_dir() -> Path:
@@ -171,6 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv_file()
     args = build_parser().parse_args(argv)
     return int(args.func(args) or 0)
 
