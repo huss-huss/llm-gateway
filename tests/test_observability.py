@@ -85,10 +85,17 @@ def test_json_log_format_includes_request_id_and_extras():
     token = request_id_var.set("req_abc")
     try:
         record = logging.makeLogRecord(
-            {"name": "x", "levelname": "INFO", "msg": "hello", "provider": "fake"}
+            {
+                "name": "x",
+                "levelname": "INFO",
+                "msg": "hello",
+                "provider": "fake",
+                "color_message": "\x1b[36mhello\x1b[0m",
+            }
         )
         out = json.loads(JSONFormatter().format(record))
     finally:
         request_id_var.reset(token)
     assert out["msg"] == "hello" and out["level"] == "info"
     assert out["request_id"] == "req_abc" and out["provider"] == "fake"
+    assert "color_message" not in out

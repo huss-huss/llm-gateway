@@ -9,7 +9,13 @@ from datetime import UTC, datetime
 
 from llm_gateway.request_context import current_request_id
 
-_RESERVED = set(vars(logging.makeLogRecord({}))) | {"message", "asctime", "taskName"}
+# Standard LogRecord attributes (not user extras), plus uvicorn's ANSI-colored duplicate.
+_RESERVED = set(vars(logging.makeLogRecord({}))) | {
+    "message",
+    "asctime",
+    "taskName",
+    "color_message",
+}
 
 
 class JSONFormatter(logging.Formatter):
