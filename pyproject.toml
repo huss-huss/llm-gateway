@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-gateway"
+version = "0.1.0"
+description = "A self-hosted gateway for production LLM traffic: one API across providers with routing, caching, budgets, tracing, and evals."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Hussen Mohammed" }]
+requires-python = ">=3.12"
+classifiers = [
+  "Framework :: FastAPI",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "fastapi==0.146.0",
+  "uvicorn[standard]==0.54.0",
+  "pydantic==2.14.1",
+  "pydantic-settings==2.16.0",
+  "httpx==0.28.1",
+  "anthropic==1.15.0",
+  "sqlalchemy[asyncio]==2.1.5",
+  "asyncpg==0.32.0",
+  "aiosqlite==0.22.1",
+  "alembic==1.20.0",
+  "redis==8.1.0",
+  "prometheus-client==0.26.0",
+  "opentelemetry-api==1.45.1",
+  "opentelemetry-sdk==1.45.1",
+  "opentelemetry-exporter-otlp-proto-http==1.45.1",
+  "pyyaml==6.0.3",
+  "jsonschema==4.26.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "fakeredis[lua]==2.40.0",
+  "ruff==0.17.1",
+]
+
+[project.scripts]
+llm-gateway = "llm_gateway.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llm_gateway"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "SIM", "RUF"]
+ignore = ["B008", "RUF012"]

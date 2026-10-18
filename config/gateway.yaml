@@ -1,0 +1,29 @@
+# llm-gateway routing configuration.
+# Strings support ${ENV_VAR} and ${ENV_VAR:-default} expansion.
+# A provider whose `api_key_env` variable is unset is disabled and skipped by the router.
+
+defaults:
+  max_tokens: 1024     # used when the client sends no max_tokens (Anthropic requires one)
+  timeout_s: 60
+
+providers:
+  fake:
+    type: fake
+    # Deterministic replies used by the quick start and the example eval suite.
+    rules:
+      - match: "capital of france"
+        reply: "The capital of France is Paris."
+      - match: "2 \\+ 2|two plus two"
+        reply: "4"
+      - match: "json"
+        reply: '{"name": "Ada Lovelace", "born": 1815}'
+      - match: "weather"
+        tool_call: { name: get_weather, arguments: { city: "Addis Ababa" } }
+      - match: "weather"
+        reply: "It is sunny in Addis Ababa."
+
+aliases:
+  fast:
+    - fake/fake-fast
+  smart:
+    - fake/fake-smart
