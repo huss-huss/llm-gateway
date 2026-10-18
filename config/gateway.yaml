@@ -50,6 +50,9 @@ routing:
     failure_threshold: 5
     cooldown_s: 30
 
+limits:
+  default_rpm: 600      # per API key, for keys created without their own --rpm
+
 cache:
   enabled: true
   ttl_s: 3600           # only temperature=0 requests are cached

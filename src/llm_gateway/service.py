@@ -113,17 +113,57 @@ class ChatService:
         )
         return err
 
+    async def _preflight(self, ctx: AuthContext, req: ChatCompletionRequest) -> dict[str, str]:
+        """Enforce rate limit and budget before any provider is called."""
+        headers: dict[str, str] = {}
+        rpm = ctx.rate_limit_rpm or self.state.config.limits.default_rpm
+        if rpm:
+            bucket = str(ctx.key_id) if ctx.key_id is not None else f"anon:{ctx.tenant}"
+            decision = await self.state.limiter.hit(bucket, rpm)
+            headers.update(decision.headers())
+            if not decision.allowed:
+                raise GatewayHTTPError(
+                    429,
+                    f"rate limit of {rpm} requests/minute exceeded for this API key",
+                    "rate_limit_error",
+                    "rate_limit_exceeded",
+                    decision.headers(),
+                )
+        remaining = await self.state.budgets.remaining_usd(ctx)
+        if remaining is not None:
+            if remaining <= 0:
+                raise GatewayHTTPError(
+                    402,
+                    f"monthly budget of ${ctx.monthly_budget_usd} exhausted for this API key",
+                    "budget_exceeded",
+                    "monthly_budget_exceeded",
+                    headers,
+                )
+            headers["x-gateway-budget-remaining-usd"] = f"{remaining:.6f}"
+        return headers
+
+    async def _begin(
+        self, ctx: AuthContext, req: ChatCompletionRequest, rid: str, started: float
+    ) -> dict[str, str]:
+        try:
+            self.state.router.targets(req.model)
+        except NoRouteError as exc:
+            raise await self._fail(exc, ctx, req, rid, started) from exc
+        return await self._preflight(ctx, req)
+
     # ---------------------------------------------------------------- entry points
 
     async def complete(
         self, ctx: AuthContext, req: ChatCompletionRequest, request_id: str
     ) -> ChatResult:
         started = time.perf_counter()
+        pre_headers = await self._begin(ctx, req, request_id, started)
         try:
             result = await self.state.router.complete(req)
         except (NoRouteError, ProviderError) as exc:
             raise await self._fail(exc, ctx, req, request_id, started) from exc
         cost = self.state.catalog.cost(result.target.id, result.response.usage)
+        await self.state.budgets.add(ctx, cost or 0.0)
         await self.state.ledger.record(
             self._record(
                 ctx=ctx,
@@ -141,12 +181,15 @@ class ChatService:
         payload = completion_body(
             completion_id=new_completion_id(), model=req.model, resp=result.response
         )
-        return ChatResult(payload, self._headers(result.target, result.attempts, cost))
+        return ChatResult(
+            payload, {**pre_headers, **self._headers(result.target, result.attempts, cost)}
+        )
 
     async def stream(
         self, ctx: AuthContext, req: ChatCompletionRequest, request_id: str
     ) -> StreamResult:
         started = time.perf_counter()
+        pre_headers = await self._begin(ctx, req, request_id, started)
         try:
             route = await self.state.router.open_stream(req)
         except (NoRouteError, ProviderError) as exc:
@@ -154,7 +197,7 @@ class ChatService:
 
         include_usage = bool((req.stream_options or {}).get("include_usage"))
         acc = StreamAccumulator()
-        catalog, ledger = self.state.catalog, self.state.ledger
+        catalog, ledger, budgets = self.state.catalog, self.state.ledger, self.state.budgets
 
         async def events() -> AsyncIterator[str]:
             status, http_status = "ok", 200
@@ -174,6 +217,7 @@ class ChatService:
             finally:
                 resp = acc.response()
                 cost = catalog.cost(route.target.id, resp.usage)
+                await budgets.add(ctx, cost or 0.0)
                 await ledger.record(
                     self._record(
                         ctx=ctx,
@@ -190,4 +234,6 @@ class ChatService:
                 )
             yield DONE
 
-        return StreamResult(events(), self._headers(route.target, route.attempts, None))
+        return StreamResult(
+            events(), {**pre_headers, **self._headers(route.target, route.attempts, None)}
+        )

@@ -57,6 +57,10 @@ class CacheConfig(BaseModel):
     ttl_s: int = 3600
 
 
+class LimitsConfig(BaseModel):
+    default_rpm: int | None = 600  # applies to keys without their own rate_limit_rpm
+
+
 class Defaults(BaseModel):
     max_tokens: int = 1024
     timeout_s: float = 60.0
@@ -68,6 +72,7 @@ class GatewayConfig(BaseModel):
     aliases: dict[str, list[Target]] = Field(default_factory=dict)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
+    limits: LimitsConfig = Field(default_factory=LimitsConfig)
 
     @field_validator("aliases", mode="before")
     @classmethod

@@ -4,15 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from llm_gateway.auth import KeyStore
+from llm_gateway.budget import BudgetTracker
 from llm_gateway.catalog import Catalog, load_catalog
 from llm_gateway.config import GatewayConfig, load_gateway_config
 from llm_gateway.db.session import make_engine, make_sessionmaker
 from llm_gateway.ledger import UsageLedger
 from llm_gateway.providers import build_provider
 from llm_gateway.providers.base import Provider
+from llm_gateway.ratelimit import RateLimiter
+from llm_gateway.redis_client import make_redis
 from llm_gateway.router import Router
 from llm_gateway.settings import Settings
 
@@ -28,11 +32,15 @@ class GatewayState:
     sessionmaker: async_sessionmaker
     keys: KeyStore
     ledger: UsageLedger
+    redis: Redis
+    limiter: RateLimiter
+    budgets: BudgetTracker
 
     async def aclose(self) -> None:
         for provider in self.providers.values():
             await provider.aclose()
         await self.engine.dispose()
+        await self.redis.aclose()
 
 
 def build_providers(config: GatewayConfig, catalog: Catalog | None = None) -> dict[str, Provider]:
@@ -56,6 +64,7 @@ async def build_state(settings: Settings, config: GatewayConfig | None = None) -
     providers = build_providers(config, catalog)
     engine = make_engine(settings.database_url)
     sessionmaker = make_sessionmaker(engine)
+    redis = make_redis(settings.redis_url)
     return GatewayState(
         settings=settings,
         config=config,
@@ -66,4 +75,7 @@ async def build_state(settings: Settings, config: GatewayConfig | None = None) -
         sessionmaker=sessionmaker,
         keys=KeyStore(sessionmaker, settings.key_pepper.get_secret_value()),
         ledger=UsageLedger(sessionmaker),
+        redis=redis,
+        limiter=RateLimiter(redis),
+        budgets=BudgetTracker(redis, sessionmaker),
     )
