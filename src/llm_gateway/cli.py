@@ -48,7 +48,9 @@ async def _with_state(fn):
 def cmd_keys(args: argparse.Namespace) -> int:
     async def run(state):
         if args.keys_cmd == "create":
-            raw, row = await state.keys.create(args.name, args.tenant, args.rpm, args.budget)
+            raw, row = await state.keys.create(
+                args.name, args.tenant, args.rpm, args.budget, rate_limit_tpm=args.tpm
+            )
             print(
                 json.dumps(
                     {
@@ -174,6 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--name", required=True)
     create.add_argument("--tenant", required=True)
     create.add_argument("--rpm", type=int, default=None, help="requests per minute limit")
+    create.add_argument("--tpm", type=int, default=None, help="tokens per minute limit")
     create.add_argument("--budget", type=float, default=None, help="monthly budget in USD")
     keys_sub.add_parser("list")
     revoke = keys_sub.add_parser("revoke")

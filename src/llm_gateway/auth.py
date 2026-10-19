@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from llm_gateway.db.models import ApiKey
 
 KEY_PREFIX = "lgw_"
+UPDATABLE_FIELDS = {"rate_limit_rpm", "rate_limit_tpm", "monthly_budget_usd"}
 
 
 def generate_key() -> str:
@@ -35,6 +37,7 @@ class AuthContext:
     tenant: str
     rate_limit_rpm: int | None = None
     monthly_budget_usd: Decimal | None = None
+    rate_limit_tpm: int | None = None
 
     @classmethod
     def anonymous(cls) -> AuthContext:
@@ -59,6 +62,7 @@ class KeyStore:
         tenant: str,
         rate_limit_rpm: int | None = None,
         monthly_budget_usd: Decimal | float | None = None,
+        rate_limit_tpm: int | None = None,
     ) -> tuple[str, ApiKey]:
         raw = generate_key()
         row = ApiKey(
@@ -67,6 +71,7 @@ class KeyStore:
             prefix=raw[:12],
             key_hash=hash_key(raw, self.pepper),
             rate_limit_rpm=rate_limit_rpm,
+            rate_limit_tpm=rate_limit_tpm,
             monthly_budget_usd=(
                 Decimal(str(monthly_budget_usd)) if monthly_budget_usd is not None else None
             ),
@@ -84,8 +89,32 @@ class KeyStore:
             if row.revoked_at is None:
                 row.revoked_at = datetime.now(UTC)
                 await session.commit()
-        self._cache = {h: v for h, v in self._cache.items() if not v[1] or v[1].key_id != key_id}
+        self._forget(key_id)
         return row
+
+    async def update(self, key_id: int, **fields: Any) -> ApiKey | None:
+        """Change a key's limits (``rate_limit_rpm``, ``rate_limit_tpm``, ``monthly_budget_usd``).
+
+        Like revocation, the change is immediate here and reaches other replicas within
+        ``cache_ttl_s``.
+        """
+        unknown = set(fields) - UPDATABLE_FIELDS
+        if unknown:
+            raise ValueError(f"cannot update {sorted(unknown)}")
+        if fields.get("monthly_budget_usd") is not None:
+            fields["monthly_budget_usd"] = Decimal(str(fields["monthly_budget_usd"]))
+        async with self.sessionmaker() as session:
+            row = await session.get(ApiKey, key_id)
+            if row is None:
+                return None
+            for name, value in fields.items():
+                setattr(row, name, value)
+            await session.commit()
+        self._forget(key_id)
+        return row
+
+    def _forget(self, key_id: int) -> None:
+        self._cache = {h: v for h, v in self._cache.items() if not v[1] or v[1].key_id != key_id}
 
     async def list(self) -> list[ApiKey]:
         async with self.sessionmaker() as session:
@@ -109,6 +138,7 @@ class KeyStore:
                 tenant=row.tenant,
                 rate_limit_rpm=row.rate_limit_rpm,
                 monthly_budget_usd=row.monthly_budget_usd,
+                rate_limit_tpm=row.rate_limit_tpm,
             )
         self._cache[digest] = (now, ctx)
         return ctx

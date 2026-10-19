@@ -56,6 +56,10 @@ routing:
 
 limits:
   default_rpm: 600      # per API key, for keys created without their own --rpm
+  default_tpm: null     # tokens per minute, for keys without their own --tpm (null = unlimited)
+  # Completion tokens reserved against TPM when a request sets no max_tokens
+  # (null = defaults.max_tokens).
+  completion_token_allowance: null
 
 cache:
   enabled: true

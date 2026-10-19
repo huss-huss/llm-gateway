@@ -43,6 +43,7 @@ class ApiKey(Base):
     # HMAC-SHA256(pepper, key) hex. The raw key is shown once and never stored.
     key_hash: Mapped[str] = mapped_column(String(64), unique=True)
     rate_limit_rpm: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rate_limit_tpm: Mapped[int | None] = mapped_column(Integer, nullable=True)
     monthly_budget_usd: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

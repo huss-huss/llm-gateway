@@ -7,7 +7,7 @@ from datetime import date
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Header, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from llm_gateway.api.deps import get_state
 from llm_gateway.auth import AuthContext, bearer_token
@@ -39,6 +39,18 @@ class CreateKey(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     tenant: str = Field(min_length=1, max_length=200)
     rate_limit_rpm: int | None = Field(default=None, ge=1)
+    rate_limit_tpm: int | None = Field(default=None, ge=1)
+    monthly_budget_usd: Decimal | None = Field(default=None, ge=0)
+
+
+class UpdateKey(BaseModel):
+    """Only the fields present in the body change; ``null`` clears a limit (the key then
+    falls back to the configured default, if any)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rate_limit_rpm: int | None = Field(default=None, ge=1)
+    rate_limit_tpm: int | None = Field(default=None, ge=1)
     monthly_budget_usd: Decimal | None = Field(default=None, ge=0)
 
 
@@ -49,6 +61,7 @@ def key_view(row: ApiKey) -> dict:
         "tenant": row.tenant,
         "prefix": row.prefix,
         "rate_limit_rpm": row.rate_limit_rpm,
+        "rate_limit_tpm": row.rate_limit_tpm,
         "monthly_budget_usd": (
             float(row.monthly_budget_usd) if row.monthly_budget_usd is not None else None
         ),
@@ -61,7 +74,11 @@ def key_view(row: ApiKey) -> dict:
 async def create_key(body: CreateKey, request: Request):
     state = get_state(request)
     raw, row = await state.keys.create(
-        body.name, body.tenant, body.rate_limit_rpm, body.monthly_budget_usd
+        body.name,
+        body.tenant,
+        body.rate_limit_rpm,
+        body.monthly_budget_usd,
+        rate_limit_tpm=body.rate_limit_tpm,
     )
     # The raw key is returned exactly once.
     return {**key_view(row), "key": raw}
@@ -77,6 +94,14 @@ async def list_keys(request: Request):
         view["month_spend_usd"] = round(await state.budgets.spent_usd(ctx), 8)
         out.append(view)
     return {"data": out}
+
+
+@router.patch("/keys/{key_id}", dependencies=[Depends(require_admin)])
+async def update_key(key_id: int, body: UpdateKey, request: Request):
+    row = await get_state(request).keys.update(key_id, **body.model_dump(exclude_unset=True))
+    if row is None:
+        raise GatewayHTTPError(404, f"key {key_id} not found", "not_found", "key_not_found")
+    return key_view(row)
 
 
 @router.delete("/keys/{key_id}", dependencies=[Depends(require_admin)])
