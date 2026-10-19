@@ -1,4 +1,4 @@
-"""``llm-gateway`` command line: serve, migrate, manage keys, run evals."""
+"""``llm-gateway`` command line: serve, migrate, manage keys, run and compare evals."""
 
 from __future__ import annotations
 
@@ -109,6 +109,35 @@ def cmd_eval(args: argparse.Namespace) -> int:
     return 0 if report.pass_rate >= args.min_pass_rate else 1
 
 
+def cmd_eval_diff(args: argparse.Namespace) -> int:
+    from llm_gateway.db.session import make_engine, make_sessionmaker
+    from llm_gateway.evals.diff import RunNotFoundError, diff_runs, format_diff, load_run
+
+    async def run():
+        engine = make_engine(args.url or Settings().database_url)
+        try:
+            sm = make_sessionmaker(engine)
+            return diff_runs(
+                await load_run(sm, args.run_a, args.suite),
+                await load_run(sm, args.run_b, args.suite),
+            )
+        finally:
+            await engine.dispose()
+
+    try:
+        d = asyncio.run(run())
+    except RunNotFoundError as exc:
+        print(f"eval diff: {exc}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        for w in d.warnings:  # also in the payload; stderr keeps them visible in CI logs
+            print(f"warning: {w}", file=sys.stderr)
+        print(json.dumps(d.to_dict(args.fail_on), indent=2))
+    else:
+        print(format_diff(d, args.fail_on))
+    return 1 if d.gate_failures(args.fail_on) else 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -167,6 +196,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="exit non-zero below this pass rate (0-1), for CI gates",
     )
     run.set_defaults(func=cmd_eval)
+
+    diff = ev_sub.add_parser(
+        "diff",
+        help="compare two stored runs case by case",
+        description="Compare two stored eval runs. RUN is a run id, 'latest', or 'previous'. "
+        "Exit codes: 0 gate passed, 1 gate failed, 2 run not found.",
+    )
+    diff.add_argument("run_a", metavar="RUN_A", help="baseline run")
+    diff.add_argument("run_b", metavar="RUN_B", help="candidate run")
+    diff.add_argument("--format", choices=["text", "json"], default="text")
+    diff.add_argument(
+        "--fail-on",
+        choices=["regression", "pass-rate", "never"],
+        default="regression",
+        help="regression: any regressed case or a lower pass rate (default); "
+        "pass-rate: only a lower pass rate; never: always exit 0",
+    )
+    diff.add_argument(
+        "--suite", default=None, help="resolve latest/previous among runs of this suite only"
+    )
+    diff.add_argument("--url", default=None, help="database URL (default: GATEWAY_DATABASE_URL)")
+    diff.set_defaults(func=cmd_eval_diff)
     return p
 
 

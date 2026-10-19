@@ -35,6 +35,13 @@ jobs:
         run: |
           .venv/bin/llm-gateway db upgrade
           .venv/bin/llm-gateway eval run evals/suite.yaml --model fast --min-pass-rate 0.8
+      - name: eval diff against a second run (fails on any regression)
+        env:
+          GATEWAY_DATABASE_URL: sqlite+aiosqlite:///./ci-evals.db
+          GATEWAY_LOG_LEVEL: WARNING
+        run: |
+          .venv/bin/llm-gateway eval run evals/suite.yaml --model fast > /dev/null
+          .venv/bin/llm-gateway eval diff previous latest --suite smoke --fail-on regression
 
   test-services:
     name: test (postgres + redis)
