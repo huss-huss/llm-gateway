@@ -482,6 +482,62 @@ pricing as live traffic, but skip auth, rate limits, and the cache. In the fake 
 judge always answers PASS, so it only tests the plumbing. Point `--judge-model` at a real model
 for real grading.
 
+### Comparing runs
+
+`eval diff` compares two stored runs case by case. A run is a run id, `latest`, or `previous`:
+
+```bash
+.venv/bin/llm-gateway eval diff previous latest
+```
+```
+Eval run #1 (smoke, fast)  ->  #2 (smoke, fast)
+
+  status         case                A     B        latency ms (A -> B)   cost delta
+  regressed      capital-of-france   PASS  FAIL            26 -> 26 (0)    $0.000000
+  still_failing  translate-hello     FAIL  FAIL            26 -> 26 (0)    $0.000000
+  unchanged      arithmetic-exact    PASS  PASS            26 -> 26 (0)    $0.000000
+  unchanged      person-json-schema  PASS  PASS            26 -> 26 (0)    $0.000000
+  unchanged      year-regex          PASS  PASS            26 -> 26 (0)    $0.000000
+  unchanged      judged-capital      PASS  PASS            26 -> 26 (0)    $0.000000
+
+                      run #1        run #2         delta
+  pass rate            83.3%         66.7%      -16.7 pp
+  passed                 5/6           4/6            -1
+  avg latency        26.0 ms       26.0 ms        0.0 ms
+  p95 latency          26 ms         26 ms          0 ms
+  cost             $0.000141     $0.000141     $0.000000
+
+1 regressed, 0 fixed, 1 still failing, 0 new, 0 removed, 4 unchanged
+FAIL (--fail-on regression): 1 case regressed; pass rate dropped 83.3% -> 66.7%
+```
+
+In this example the second run used a stricter assertion for `capital-of-france`. Cases are
+matched by case id and get one of these statuses: `fixed`, `regressed`,
+`still_failing`, `unchanged`, `new` (only in the second run), or `removed` (only in the first).
+Regressions are listed first. If the runs come from different suites or models, `eval diff`
+prints a warning and still compares by case id.
+
+Options:
+
+- `--format json` for machine-readable output (runs, deltas, per-case statuses, gate result)
+- `--fail-on regression` (default) exits 1 if any case regressed or the pass rate dropped;
+  `--fail-on pass-rate` exits 1 only if the pass rate dropped; `--fail-on never` always exits 0
+- `--suite NAME` resolves `latest` / `previous` among runs of that suite only
+- `--url` reads from another database (default: `GATEWAY_DATABASE_URL`)
+
+Exit codes are 0 (gate passed), 1 (gate failed), and 2 (a run was not found). That makes it
+usable as a CI gate against a stored baseline:
+
+```bash
+llm-gateway eval run evals/suite.yaml --model fast
+llm-gateway eval diff "$BASELINE_RUN_ID" latest --suite smoke
+```
+
+CI runs the example suite twice on the fake provider and diffs the two runs
+(`eval diff previous latest --suite smoke`). The fake provider is deterministic, so this checks
+the command end to end. With a persistent eval database, the same step compares each change
+against the last run on `main`.
+
 ## Design trade-offs
 
 - **OpenAI wire format as the common language.** Most SDKs and tools already speak it. The
@@ -547,13 +603,13 @@ What the suite covers:
 - the OpenAI and Ollama adapters with mock transports
 - SSE format, cost calculation, auth and revocation, admin endpoints
 - tracing spans, metrics, and Alembic migrations matching the models
-- evals
+- evals, and `eval diff` (every case status and `--fail-on` policy)
 
 No test makes a network call. CI (`.github/workflows/ci.yml`) runs:
 
 - lint
 - the suite on SQLite
-- the example eval with a pass-rate gate
+- the example eval with a pass-rate gate, and `eval diff` against a second run
 - the suite against Postgres 17 + Redis 7.4, after `alembic upgrade` and `alembic check`
 
 ## Limitations (v0.1)
@@ -586,7 +642,7 @@ No test makes a network call. CI (`.github/workflows/ci.yml`) runs:
 - Weighted and latency-aware routing, plus per-request routing hints
 - Shared circuit-breaker state in Redis
 - Opt-in semantic cache, per alias
-- Comparing evals across runs (`eval diff`), and importing datasets from the ledger
+- Importing eval datasets from the ledger
 - Embeddings endpoint
 - Helm chart
 
