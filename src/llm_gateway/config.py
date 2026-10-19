@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
@@ -41,8 +41,20 @@ class Target(BaseModel):
 
 
 class BreakerConfig(BaseModel):
-    failure_threshold: int = 5
-    cooldown_s: float = 30.0
+    failure_threshold: int = 5  # failures within window_s that open the circuit
+    window_s: float = 60.0  # failures older than this (counted from the first) are forgotten
+    cooldown_s: float = 30.0  # open -> half-open after this long
+    # How long the single half-open probe holds its lease before another caller may probe
+    # (None: the provider's timeout_s). Covers a probe whose outcome is never reported.
+    probe_lease_s: float | None = None
+    # memory: per-process state. redis: shared across replicas through GATEWAY_REDIS_URL.
+    backend: Literal["memory", "redis"] = "memory"
+    # redis backend only: how long an open/half-open circuit's state outlives its cooldown
+    # with no activity, the time budget for one Redis call, and how long to stay on the
+    # in-process fallback after a Redis error before trying Redis again.
+    state_ttl_s: float = 3600.0
+    store_timeout_s: float = 0.25
+    store_retry_s: float = 5.0
 
 
 class RoutingConfig(BaseModel):
@@ -98,6 +110,14 @@ class GatewayConfig(BaseModel):
             return False
         key_env = cfg.get("api_key_env")
         return not (key_env and not os.environ.get(key_env))
+
+    def timeout_for(self, provider: str) -> float:
+        cfg = self.providers.get(provider, {})
+        return float(cfg.get("timeout_s", self.defaults.timeout_s))
+
+    def probe_lease_for(self, provider: str) -> float:
+        lease = self.routing.breaker.probe_lease_s
+        return lease if lease is not None else self.timeout_for(provider)
 
     def resolve(self, model: str) -> list[Target]:
         """Resolve a requested model (alias or ``provider/model``) to an ordered target list."""

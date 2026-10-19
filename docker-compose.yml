@@ -34,6 +34,7 @@ services:
     environment:
       GATEWAY_DATABASE_URL: postgresql+asyncpg://llm_gateway:llm_gateway@postgres:5432/llm_gateway
       GATEWAY_REDIS_URL: redis://redis:6379/0
+      GATEWAY_BREAKER_BACKEND: ${GATEWAY_BREAKER_BACKEND:-redis}   # share breakers across replicas
       GATEWAY_ADMIN_KEY: ${GATEWAY_ADMIN_KEY:?set GATEWAY_ADMIN_KEY in .env}
       GATEWAY_KEY_PEPPER: ${GATEWAY_KEY_PEPPER:?set GATEWAY_KEY_PEPPER in .env}
       GATEWAY_OTEL_EXPORTER: ${GATEWAY_OTEL_EXPORTER:-none}

@@ -8,6 +8,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from llm_gateway.auth import KeyStore
+from llm_gateway.breaker import build_breakers
 from llm_gateway.budget import BudgetTracker
 from llm_gateway.cache import ResponseCache
 from llm_gateway.catalog import Catalog, load_catalog
@@ -72,7 +73,7 @@ async def build_state(settings: Settings, config: GatewayConfig | None = None) -
         config=config,
         catalog=catalog,
         providers=providers,
-        router=Router(config, providers),
+        router=Router(config, providers, breakers=build_breakers(config, providers, redis)),
         engine=engine,
         sessionmaker=sessionmaker,
         keys=KeyStore(sessionmaker, settings.key_pepper.get_secret_value()),

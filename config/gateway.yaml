@@ -51,8 +51,15 @@ routing:
   backoff_base_s: 0.25  # exponential, jittered, honours Retry-After (capped)
   backoff_max_s: 4
   breaker:
-    failure_threshold: 5
-    cooldown_s: 30
+    backend: ${GATEWAY_BREAKER_BACKEND:-memory}  # memory (per replica) | redis (shared)
+    failure_threshold: 5  # provider failures within window_s that open the circuit
+    window_s: 60
+    cooldown_s: 30        # open -> half-open (one probe) after this long
+    probe_lease_s: null   # how long the probe may take before another caller probes (null = provider timeout_s)
+    # redis backend only:
+    state_ttl_s: 3600     # an idle open/half-open circuit is forgotten this long after its cooldown
+    store_timeout_s: 0.25 # per Redis call; on error or timeout use in-process breakers...
+    store_retry_s: 5      # ...for this long, then try Redis again
 
 limits:
   default_rpm: 600      # per API key, for keys created without their own --rpm

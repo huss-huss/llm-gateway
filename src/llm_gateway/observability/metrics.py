@@ -42,6 +42,21 @@ BREAKER_STATE = Gauge(
     ["provider"],
 )
 
+BREAKER_TRANSITIONS = Counter(
+    "llm_gateway_circuit_transitions_total",
+    "Circuit state changes made by this replica (backend: memory, or redis for shared state).",
+    ["provider", "from_state", "to_state", "backend"],
+)
+BREAKER_STORE_DEGRADED = Gauge(
+    "llm_gateway_circuit_store_degraded",
+    "1 while the Redis breaker store is unavailable and in-process breakers are used instead.",
+)
+BREAKER_STORE_ERRORS = Counter(
+    "llm_gateway_circuit_store_errors_total",
+    "Failed or timed-out calls to the Redis breaker store, by operation.",
+    ["op"],
+)
+
 _BREAKER_VALUES = {"closed": 0, "half_open": 1, "open": 2}
 
 
@@ -53,6 +68,11 @@ def observe_attempt(provider: str, model: str, outcome: str, elapsed_s: float) -
 
 def observe_breaker(provider: str, state: str) -> None:
     BREAKER_STATE.labels(provider).set(_BREAKER_VALUES.get(state, 0))
+
+
+def observe_breaker_transition(provider: str, old: str, new: str, backend: str) -> None:
+    BREAKER_TRANSITIONS.labels(provider, old, new, backend).inc()
+    observe_breaker(provider, new)
 
 
 def observe_completion(
