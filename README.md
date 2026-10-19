@@ -41,7 +41,7 @@ serves it, enforces limits, records cost, and emits traces and metrics.
                          |        |                                                     |
                          |  auth: API key -> HMAC-SHA256 hash lookup                    |
                          |        |                                                     |
-                         |  rate limit  (Redis token bucket, atomic Lua)                |
+                         |  rate limits (RPM + TPM Redis token buckets, atomic Lua)     |
                          |  budget      (Redis month-to-date spend, rebuilt from ledger)|
                          |  cache       (Redis, temperature == 0, per tenant)           |
                          |        |                                                     |
@@ -69,7 +69,7 @@ Code map (`src/llm_gateway/`):
 | `providers/` | `openai.py`, `anthropic.py`, `ollama.py`, `fake.py` behind one `Provider` interface |
 | `streaming.py` | OpenAI `chat.completion.chunk` SSE encoding and stream accumulation |
 | `catalog.py` + `config/models.yaml` | prices and capability flags per model |
-| `cache.py`, `ratelimit.py`, `budget.py` | Redis-backed cache, token bucket, spend counters |
+| `cache.py`, `ratelimit.py`, `budget.py` | Redis-backed cache, request/token buckets, spend counters |
 | `auth.py`, `ledger.py`, `usage.py`, `db/` | keys, usage ledger, reporting, SQLAlchemy models |
 | `observability/` | JSON logging, Prometheus metrics, OpenTelemetry setup |
 | `evals/` | suite format, assertions, runner |
@@ -87,15 +87,19 @@ For `POST /v1/chat/completions`:
 3. **Resolve the route.** For example, `fast` -> `[anthropic/claude-haiku-5-5,
    openai/gpt-4.1-mini, ollama/llama3.2, fake/fake-fast]`. Providers without credentials are
    skipped. An unknown model gets `404 model_not_found`.
-4. **Rate limit.** Each request takes one token from the key's bucket (capacity = RPM,
-   refilled continuously). Over the limit, the client gets `429` with `Retry-After`. These
-   rejections are not written to the ledger.
+4. **Request rate limit.** Each request takes one token from the key's request bucket
+   (capacity = RPM, refilled continuously). Over the limit, the client gets `429` with
+   `Retry-After`. These rejections are not written to the ledger.
 5. **Budget.** The key's month-to-date spend must be below its monthly budget. Spend lives in a
    Redis micro-dollar counter that is rebuilt from the ledger when cold. Over budget, the
    request gets `402` before any provider is called.
 6. **Cache.** If `temperature == 0`, look up `sha256(tenant + normalized request)`. A hit
    returns the stored completion (or replays it as SSE), costs $0, and is flagged in the ledger.
-7. **Route.** Try each target in order. Each attempt is a `provider.call` span with a timeout.
+   It skips the token limit entirely.
+7. **Token rate limit.** If the key has a TPM limit, reserve the request's estimated tokens
+   (prompt estimate + `max_tokens`) in its token bucket, or return `429` with `Retry-After`.
+   See [Rate limits](#rate-limits).
+8. **Route.** Try each target in order. Each attempt is a `provider.call` span with a timeout.
    - 429, 5xx, timeout, connection error: retry the same target with jittered exponential
      backoff (respecting `Retry-After`, capped), then fall back to the next target.
    - 401/403 (bad provider credentials) or 404 (unknown model on that provider): fall back
@@ -105,12 +109,13 @@ For `POST /v1/chat/completions`:
    - Streams: the first chunk is pulled inside the retry loop, so fallback still works until
      the first byte reaches the client. After that, upstream errors are reported in-band as an
      SSE `error` event.
-8. **Price.** `usage x price` from `config/models.yaml`, with cached-token and long-context
+9. **Settle and price.** Replace the token reservation with the actual usage (refunding or
+   charging the difference). Then `usage x price` from `config/models.yaml`, with cached-token and long-context
    rates where defined.
-9. **Record.** Add the spend to the key's counter and write one `usage_events` row (tokens
+10. **Record.** Add the spend to the key's counter and write one `usage_events` row (tokens
    in/out, cost, latency, provider, model, cache hit, status, attempts). Then update Prometheus
    metrics, log one JSON line, and close the span (for streams, when the stream ends).
-10. **Respond** with gateway headers:
+11. **Respond** with gateway headers:
 
 | Header | Meaning |
 |---|---|
@@ -119,8 +124,60 @@ For `POST /v1/chat/completions`:
 | `x-gateway-cost-usd` | cost of this request (non-streaming responses) |
 | `x-gateway-cache` | `hit`, `miss`, or `bypass` |
 | `x-gateway-budget-remaining-usd` | remaining monthly budget (keys with a budget) |
-| `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests` | rate limit state |
+| `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests` | request rate limit state |
+| `x-ratelimit-limit-tokens`, `x-ratelimit-remaining-tokens`, `x-ratelimit-reset-tokens` | token rate limit state (keys with a TPM limit; not on cache hits) |
 | `x-request-id` | request ID |
+
+## Rate limits
+
+Every key can have two limits. Both are Redis token buckets updated by one atomic Lua script,
+with capacity equal to the per-minute limit (so a key can burst a full minute's allowance) and
+continuous refill at `limit / 60` per second:
+
+| Limit | Key field | Default (`config/gateway.yaml`) | Counts |
+|---|---|---|---|
+| requests per minute | `rate_limit_rpm` | `limits.default_rpm` (600) | 1 per request, including cache hits |
+| tokens per minute | `rate_limit_tpm` | `limits.default_tpm` (unset) | prompt + completion tokens |
+
+A key's own value takes precedence. When it is `null`, the configured default applies, and
+when that is unset too, there is no limit. Set the fields at creation (`POST /admin/keys`,
+`llm-gateway keys create --rpm N --tpm N`) or change them later with
+`PATCH /admin/keys/{id}`, which updates only the fields in the body (`null` clears one).
+Changes apply immediately on the replica that handled them and within 5 s elsewhere.
+
+**How a request is counted against TPM:**
+
+1. **Reserve.** Once the request is past the cache and a provider will be called, the gateway
+   reserves `prompt estimate + completion allowance` tokens. The prompt estimate is ~4
+   characters per token over message text, tool calls, and tool definitions, plus 4 tokens per
+   message. The completion allowance is the request's `max_completion_tokens` / `max_tokens`,
+   or `limits.completion_token_allowance` (default: `defaults.max_tokens`). The reservation is
+   capped at the limit itself, so a large `max_tokens` can't lock a key out. The Lua script
+   checks and takes the tokens in one step, so concurrent requests can't jointly reserve more
+   than the bucket holds. If the bucket is short, the request gets `429` with `Retry-After`
+   (seconds until enough tokens have refilled) and no provider is called.
+2. **Settle.** After the response, the reservation is replaced with the actual
+   `total_tokens` the provider reported. Unused tokens are refunded. If the request used more
+   than it reserved, the difference is charged, and the bucket can go negative. Later requests
+   then wait until it refills, so an under-estimate is paid back rather than forgiven. If the
+   provider reports no usage, the gateway charges its prompt estimate plus the output length.
+   A failed request (every target errored) is refunded in full.
+3. **Streams** reserve before the first byte and settle when the stream ends, from the final
+   usage chunk. If the client disconnects (or the upstream fails mid-stream) before usage
+   arrives, the gateway settles with what it knows: the prompt estimate plus the output
+   received so far.
+4. **Cache hits** don't call a provider, so they never reserve or consume TPM, and they are
+   served even when the token bucket is empty. They still count against RPM.
+
+A prompt whose estimate alone exceeds the key's TPM limit could never be admitted, so it gets
+`429` with code `request_too_large` and no `Retry-After`.
+
+**Headers.** Responses that went through the token bucket carry OpenAI-style headers:
+`x-ratelimit-limit-tokens`, `x-ratelimit-remaining-tokens` (never below 0), and
+`x-ratelimit-reset-tokens` (time until the bucket is full again, e.g. `453ms`, `10s`,
+`1m30s`). Non-streaming responses report the bucket after settlement. Streaming responses send
+headers before the body, so they report it after the reservation. Cache hits, and keys without
+a TPM limit, get no token headers.
 
 ## Quick start (no API keys, no Docker)
 
@@ -145,10 +202,10 @@ timestamps, and the key are different on every run.
 ```bash
 curl -s -X POST localhost:8080/admin/keys \
   -H "Authorization: Bearer change-me-admin-key" -H "Content-Type: application/json" \
-  -d '{"name": "quickstart", "tenant": "acme", "rate_limit_rpm": 60, "monthly_budget_usd": 5}'
+  -d '{"name": "quickstart", "tenant": "acme", "rate_limit_rpm": 60, "rate_limit_tpm": 2000, "monthly_budget_usd": 5}'
 ```
 ```json
-{"id":1,"name":"quickstart","tenant":"acme","prefix":"lgw_Gbxo5UjA","rate_limit_rpm":60,"monthly_budget_usd":5.0,"created_at":"2026-10-18T16:18:37.981317+00:00","revoked_at":null,"key":"lgw_Gbxo5UjA..."}
+{"id":1,"name":"quickstart","tenant":"acme","prefix":"lgw_CVb0SLRb","rate_limit_rpm":60,"rate_limit_tpm":2000,"monthly_budget_usd":5.0,"created_at":"2026-10-19T11:08:49.646729+00:00","revoked_at":null,"key":"lgw_CVb0SLRb..."}
 ```
 
 ```bash
@@ -167,6 +224,9 @@ HTTP/1.1 200 OK
 x-ratelimit-limit-requests: 60
 x-ratelimit-remaining-requests: 59
 x-gateway-budget-remaining-usd: 5.000000
+x-ratelimit-limit-tokens: 2000
+x-ratelimit-remaining-tokens: 1984
+x-ratelimit-reset-tokens: 453ms
 x-gateway-provider: fake
 x-gateway-model: fake-fast
 x-gateway-attempts: 1
@@ -242,6 +302,29 @@ A key that has used up its monthly budget gets a 402. These are the observed res
 {"error":{"message":"monthly budget of $0.00002000 exhausted for this API key","type":"budget_exceeded","code":"monthly_budget_exceeded"}}
 ```
 
+**Token limits.** Lowering the key's TPM limit to 100 with `PATCH /admin/keys/1`
+(`{"rate_limit_tpm": 100}`) and sending two requests without `max_tokens`: each one reserves
+the whole bucket (the default allowance of 1024 is capped at the limit), and the first settles
+at the 16 tokens it used. The second is short 16 tokens, which take 10 s to refill:
+
+```
+HTTP/1.1 200 OK
+x-ratelimit-limit-tokens: 100
+x-ratelimit-remaining-tokens: 84
+x-ratelimit-reset-tokens: 10s
+
+HTTP/1.1 429 Too Many Requests
+x-ratelimit-limit-tokens: 100
+x-ratelimit-remaining-tokens: 84
+x-ratelimit-reset-tokens: 10s
+retry-after: 10
+```
+```json
+{"error":{"message":"rate limit of 100 tokens/minute exceeded for this API key (this request needs about 100)","type":"rate_limit_error","code":"rate_limit_exceeded"}}
+```
+
+Sending `max_tokens` keeps the reservation small, so more requests fit in the bucket.
+
 **OpenAI SDK.** Existing clients only need a new `base_url`. This was observed with the
 official `openai` Python package against the fake provider:
 
@@ -281,8 +364,9 @@ One row of `data` (the response also carries `totals`):
 }
 ```
 
-Other admin endpoints: `GET /admin/keys` lists keys with month-to-date spend, and
-`DELETE /admin/keys/{id}` revokes one. The CLI does the same offline:
+Other admin endpoints: `GET /admin/keys` lists keys with month-to-date spend,
+`PATCH /admin/keys/{id}` changes a key's `rate_limit_rpm`, `rate_limit_tpm`, or
+`monthly_budget_usd`, and `DELETE /admin/keys/{id}` revokes one. The CLI does the same offline:
 `llm-gateway keys create|list|revoke`.
 
 ### With real providers
@@ -346,7 +430,10 @@ routing:
   backoff_max_s: 4
   breaker: { failure_threshold: 5, cooldown_s: 30 }
 
-limits: { default_rpm: 600 }       # for keys without their own limit
+limits:                            # for keys without their own limits
+  default_rpm: 600
+  default_tpm: null                # tokens per minute; null = unlimited
+  completion_token_allowance: null # reserved when a request has no max_tokens (null = defaults.max_tokens)
 cache:  { enabled: true, ttl_s: 3600 }
 
 aliases:
@@ -409,7 +496,7 @@ is created with `max_retries=0` because the gateway does its own retries and fal
 | `llm_gateway_tokens_total` | `provider`, `model`, `direction` |
 | `llm_gateway_cost_usd_total` | `provider`, `model` |
 | `llm_gateway_cache_requests_total` | `result` |
-| `llm_gateway_rejections_total` | `reason` (`rate_limited`, `budget_exceeded`) |
+| `llm_gateway_rejections_total` | `reason` (`rate_limited`, `token_rate_limited`, `budget_exceeded`) |
 | `llm_gateway_circuit_state` | `provider` (0 closed, 1 half-open, 2 open) |
 
 Some of the values observed after the quick start:
@@ -555,6 +642,12 @@ against the last run on `main`.
   output token count, which isn't known in advance. A request that starts under budget can
   overshoot by its own cost. Under concurrency, every request already in flight when the budget
   runs out can overshoot.
+- **Token limits reserve an estimate, then settle.** The true token count is only known after
+  the response, so the gateway reserves a pessimistic estimate up front and corrects it
+  afterwards. Reserving `max_tokens` (like OpenAI does) keeps concurrent requests from
+  overshooting, at the cost of rejecting some requests that would have fit. The prompt estimate
+  is a character count, not a tokenizer, so it is provider-agnostic and cheap but approximate.
+  Charging under-estimates as debt keeps the long-run rate correct.
 - **Spend in Redis, source of truth in Postgres.** The counter caches the month's
   `SUM(cost_usd)` for each key. If Redis is flushed, the counter is rebuilt from the ledger on
   the next request. Initialization uses `SET NX`, so concurrent rebuilds don't double count.
@@ -599,6 +692,9 @@ What the suite covers:
 - routing and fallback, retries and backoff, the circuit breaker, timeouts
 - the cache: normalization, tenant scoping, TTL, streaming replay
 - rate limits (the Lua token bucket) and budgets (enforcement, rebuild from the ledger)
+- token limits: estimate, reserve and settle (refund and charge), concurrent requests not
+  overshooting, streams (final usage chunk and client disconnect), cache hits, headers, and the
+  admin API
 - Anthropic <-> OpenAI translation through the real `anthropic` SDK with a mock transport
 - the OpenAI and Ollama adapters with mock transports
 - SSE format, cost calculation, auth and revocation, admin endpoints
@@ -625,7 +721,15 @@ No test makes a network call. CI (`.github/workflows/ci.yml`) runs:
   token).
 - No mid-stream fallback (by design). There's no per-chunk idle timeout beyond the HTTP
   client's read timeout.
-- Rate limits count requests, not tokens.
+- Token limits are enforced on estimates. The prompt estimate counts ~4 characters per token
+  and ignores images, so actual usage can exceed what was reserved. That overshoot is charged
+  to the bucket afterwards, so concurrent in-flight requests can briefly go over the limit by
+  their estimation error. Requests without `max_tokens` reserve the default allowance, which can
+  reject requests that would have fit.
+- If a client disconnects before a stream's body is first read, the reservation is not settled
+  and returns only through refill (within a minute). Failed provider attempts are refunded in
+  full even if the upstream billed for them.
+- Provider errors (4xx/5xx from upstream) don't carry `x-ratelimit-*` headers.
 - The budget is a soft cap (see the trade-offs above), and budgets are per key, not per tenant.
 - Circuit-breaker state isn't shared across replicas.
 - The Dockerfile and compose file pass `docker compose config` validation, but this release
@@ -636,7 +740,7 @@ No test makes a network call. CI (`.github/workflows/ci.yml`) runs:
 
 ## Roadmap
 
-- Token-based rate limits, and per-tenant budgets with alert thresholds
+- Per-tenant budgets with alert thresholds
 - Native `/v1/messages` passthrough for Anthropic-specific features
 - Async/batched ledger writes and usage export (CSV / Parquet)
 - Weighted and latency-aware routing, plus per-request routing hints
