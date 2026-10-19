@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from llm_gateway.config import GatewayConfig
+from llm_gateway.config import GatewayConfig, expand_env
 from llm_gateway.db.models import EvalResult, EvalRun
 from llm_gateway.evals.assertions import check
 from llm_gateway.evals.runner import EvalRunner, format_report, store_report
@@ -86,7 +86,7 @@ def eval_router(monkeypatch) -> Router:
 
     raw = yaml.safe_load((ROOT / "config" / "gateway.yaml").read_text())
     raw["providers"]["fake"]["latency_ms"] = 0
-    cfg = GatewayConfig.model_validate(raw)
+    cfg = GatewayConfig.model_validate(expand_env(raw))
     return Router(cfg, build_providers(cfg))
 
 

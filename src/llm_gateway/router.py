@@ -12,7 +12,7 @@ from typing import TypeVar
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind, Status, StatusCode
 
-from llm_gateway.breaker import CircuitBreaker
+from llm_gateway.breaker import Breakers, LocalBreakers
 from llm_gateway.config import GatewayConfig, Target
 from llm_gateway.observability import metrics
 from llm_gateway.observability.tracing import tracer
@@ -81,15 +81,12 @@ class Router:
         *,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
+        breakers: Breakers | None = None,
     ) -> None:
         self.config = config
         self.providers = providers
         self._sleep = sleep
-        bc = config.routing.breaker
-        self.breakers = {
-            name: CircuitBreaker(bc.failure_threshold, bc.cooldown_s, clock=clock)
-            for name in providers
-        }
+        self.breakers: Breakers = breakers or LocalBreakers(config, providers, clock)
 
     def targets(self, model: str) -> list[Target]:
         targets = [t for t in self.config.resolve(model) if t.provider in self.providers]
@@ -98,8 +95,7 @@ class Router:
         return targets
 
     def timeout_for(self, provider: str) -> float:
-        cfg = self.config.providers.get(provider, {})
-        return float(cfg.get("timeout_s", self.config.defaults.timeout_s))
+        return self.config.timeout_for(provider)
 
     def backoff(self, attempt: int, retry_after: float | None) -> float:
         r = self.config.routing
@@ -114,11 +110,11 @@ class Router:
         attempts: list[Attempt] = []
         last: ProviderError | None = None
         retries = self.config.routing.retries
+        breakers = self.breakers
         for target in self.targets(model):
-            breaker = self.breakers[target.provider]
             provider = self.providers[target.provider]
             for n in range(retries + 1):
-                if not breaker.allow():
+                if not await breakers.allow(target.provider):
                     attempts.append(Attempt(target.id, "circuit_open"))
                     self._notify(target, "circuit_open", 0.0)
                     break
@@ -143,7 +139,7 @@ class Router:
                         err = exc
                     else:
                         elapsed = time.perf_counter() - started
-                        breaker.record_success()
+                        await breakers.record_success(target.provider)
                         span.set_attribute("llm_gateway.outcome", "ok")
                         attempts.append(Attempt(target.id, "ok", elapsed))
                         self._notify(target, "ok", elapsed)
@@ -154,10 +150,11 @@ class Router:
                 attempts.append(Attempt(target.id, err.kind, elapsed))
                 self._notify(target, err.kind, elapsed)
                 if not err.fallback:
-                    # The request is at fault, not the provider: fail fast, don't trip breakers.
+                    # The request is at fault, not the provider: fail fast, don't trip breakers
+                    # (but hand back the half-open probe if this attempt held it).
+                    await breakers.release(target.provider)
                     raise err
-                breaker.record_failure()
-                metrics.observe_breaker(target.provider, breaker.state)
+                await breakers.record_failure(target.provider)
                 last = err
                 if not err.retryable or n == retries:
                     break
@@ -166,7 +163,6 @@ class Router:
 
     def _notify(self, target: Target, outcome: str, elapsed: float) -> None:
         metrics.observe_attempt(target.provider, target.model, outcome, elapsed)
-        metrics.observe_breaker(target.provider, self.breakers[target.provider].state)
 
     async def complete(self, req: ChatCompletionRequest) -> RouteResult:
         async def call(provider: Provider, target: Target) -> ProviderResponse:

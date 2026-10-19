@@ -78,7 +78,7 @@ async def test_invalid_request_fails_fast_without_fallback():
     router, _ = make_router({"m": ["primary/fail-400", "backup/ok"]})
     with pytest.raises(InvalidRequestError):
         await router.complete(req("m"))
-    assert router.breakers["primary"].state == "closed"
+    assert await router.breakers.state("primary") == "closed"
 
 
 async def test_all_rate_limited_maps_to_429():

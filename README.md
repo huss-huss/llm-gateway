@@ -47,7 +47,7 @@ serves it, enforces limits, records cost, and emits traces and metrics.
                          |        |                                                     |
                          |  router: alias -> [provider/model, ...]                      |
                          |    retries + jittered backoff, timeouts, fallback,           |
-                         |    per-provider circuit breaker                              |
+                         |    per-provider circuit breaker (in-process or Redis-shared) |
                          |        |                                                     |
                          |  adapters:  openai | anthropic | ollama | fake               |
                          |        |                                                     |
@@ -56,7 +56,8 @@ serves it, enforces limits, records cost, and emits traces and metrics.
                                   v                               v          v
                OpenAI / Anthropic / Ollama APIs            Redis       Postgres
                                                      (limits, cache,  (keys, usage ledger,
-               OTLP collector (Jaeger), Prometheus     spend)          eval results)
+               OTLP collector (Jaeger), Prometheus     spend,          eval results)
+                                                      breakers)
 ```
 
 Code map (`src/llm_gateway/`):
@@ -65,7 +66,7 @@ Code map (`src/llm_gateway/`):
 |---|---|
 | `api/chat.py`, `api/admin.py` | HTTP endpoints |
 | `service.py` | the request pipeline (limits, cache, routing, pricing, ledger) |
-| `router.py`, `breaker.py` | alias resolution, retries/backoff, fallback, circuit breaker |
+| `router.py`, `breaker.py` | alias resolution, retries/backoff, fallback, circuit breakers (in-process or Redis) |
 | `providers/` | `openai.py`, `anthropic.py`, `ollama.py`, `fake.py` behind one `Provider` interface |
 | `streaming.py` | OpenAI `chat.completion.chunk` SSE encoding and stream accumulation |
 | `catalog.py` + `config/models.yaml` | prices and capability flags per model |
@@ -105,7 +106,7 @@ For `POST /v1/chat/completions`:
    - 401/403 (bad provider credentials) or 404 (unknown model on that provider): fall back
      without retrying.
    - 400 (invalid request): fail fast. No fallback, and the breaker is not tripped.
-   - A provider whose breaker is open is skipped.
+   - A provider whose breaker is open is skipped. See [Circuit breakers](#circuit-breakers).
    - Streams: the first chunk is pulled inside the retry loop, so fallback still works until
      the first byte reaches the client. After that, upstream errors are reported in-band as an
      SSE `error` event.
@@ -178,6 +179,52 @@ A prompt whose estimate alone exceeds the key's TPM limit could never be admitte
 `1m30s`). Non-streaming responses report the bucket after settlement. Streaming responses send
 headers before the body, so they report it after the reservation. Cache hits, and keys without
 a TPM limit, get no token headers.
+
+## Circuit breakers
+
+Each provider has a breaker (one per provider, so failures on one of its models count against
+its other models too). Only failures that fall back count: 429, 5xx, timeouts, connection
+errors, and 401/403/404 from the provider. A 400 is the request's fault and never counts.
+
+- **Closed:** calls go through. `failure_threshold` failures within `window_s` (counted from
+  the first failure in the window) open the circuit. A success resets the count.
+- **Open:** the provider is skipped (attempt outcome `circuit_open`) for `cooldown_s`. When
+  every target is open, the client gets `503 circuit_open`.
+- **Half-open:** after the cooldown, exactly one call (the probe) goes through. If it succeeds
+  the circuit closes; if it fails the circuit opens for another cooldown. The probe holds a
+  lease of `probe_lease_s` (default: the provider's `timeout_s`), so a probe that never
+  reports back (a crashed replica) is replaced once the lease expires. A probe that ends in a
+  400 hands the lease back at once.
+
+**Backends** (`routing.breaker.backend`):
+
+| Backend | State | Use it for |
+|---|---|---|
+| `memory` (default) | per process | a single replica, or when replicas should act independently |
+| `redis` | shared through `GATEWAY_REDIS_URL` | several replicas: a failing provider is tripped once for all of them |
+
+With `redis`, each provider's breaker is one hash, `breaker:{provider}`, holding the state,
+the failure count and window start, the time the circuit opened, and the probe lease. Every
+operation (allow, success, failure, release) is one Lua script, so concurrent replicas can't
+both take the probe or lose a failure. Keys clean themselves up: a healthy provider has no
+key, a closed circuit's failure count expires with its window, and an open or half-open
+circuit with no activity expires `state_ttl_s` after its cooldown (a missing key reads as
+closed). The Docker Compose file selects `redis`; elsewhere set
+`GATEWAY_BREAKER_BACKEND=redis` or edit `config/gateway.yaml`.
+
+**If Redis is unavailable,** the breaker store never fails a request. A Redis error, or a call
+slower than `store_timeout_s` (250 ms), switches that replica to fresh in-process breakers,
+logs a warning (`circuit breaker store unavailable, falling back to in-process breakers`), and
+sets `llm_gateway_circuit_store_degraded` to 1. The replica tries Redis again after
+`store_retry_s` (5 s); when Redis answers, it logs the recovery, resets the gauge, and goes
+back to the shared state. Errors are counted in `llm_gateway_circuit_store_errors_total`.
+
+**Metrics.** `llm_gateway_circuit_transitions_total{provider, from_state, to_state, backend}`
+counts every state change. With `redis`, each change is counted once, by the replica that made
+it (the replica that sees an open circuit's cooldown end records `open -> half_open`), so a
+sum across replicas is the true count. `llm_gateway_circuit_state` is the last state this
+replica saw. Transitions are also logged (`circuit breaker closed -> open`, at warning level
+when a circuit opens).
 
 ## Quick start (no API keys, no Docker)
 
@@ -405,6 +452,7 @@ The container applies migrations on start and listens on `:8080`.
 |---|---|---|
 | `GATEWAY_DATABASE_URL` | `sqlite+aiosqlite:///./llm_gateway.db` | e.g. `postgresql+asyncpg://user:pw@host/db` |
 | `GATEWAY_REDIS_URL` | `memory://` | `redis://host:6379/0`; `memory://` is for dev only |
+| `GATEWAY_BREAKER_BACKEND` | `memory` | `redis` shares circuit breakers across replicas (read by `config/gateway.yaml`) |
 | `GATEWAY_ADMIN_KEY` | unset | the admin API returns 503 until this is set |
 | `GATEWAY_KEY_PEPPER` | `dev-pepper-change-me` | HMAC secret for key hashes; **set it in production** |
 | `GATEWAY_REQUIRE_AUTH` | `true` | `false` allows anonymous use (local experiments only) |
@@ -428,7 +476,15 @@ routing:
   retries: 2            # extra attempts per target on 429 / 5xx / timeout
   backoff_base_s: 0.25
   backoff_max_s: 4
-  breaker: { failure_threshold: 5, cooldown_s: 30 }
+  breaker:
+    backend: ${GATEWAY_BREAKER_BACKEND:-memory}  # memory | redis (shared across replicas)
+    failure_threshold: 5  # failures within window_s that open the circuit
+    window_s: 60
+    cooldown_s: 30        # open -> half-open (one probe)
+    probe_lease_s: null   # null = the provider's timeout_s
+    state_ttl_s: 3600     # redis only: idle open circuits expire this long after the cooldown
+    store_timeout_s: 0.25 # redis only: per call; on error/timeout use in-process breakers...
+    store_retry_s: 5      # ...for this long, then try Redis again
 
 limits:                            # for keys without their own limits
   default_rpm: 600
@@ -498,6 +554,9 @@ is created with `max_retries=0` because the gateway does its own retries and fal
 | `llm_gateway_cache_requests_total` | `result` |
 | `llm_gateway_rejections_total` | `reason` (`rate_limited`, `token_rate_limited`, `budget_exceeded`) |
 | `llm_gateway_circuit_state` | `provider` (0 closed, 1 half-open, 2 open) |
+| `llm_gateway_circuit_transitions_total` | `provider`, `from_state`, `to_state`, `backend` (`memory`, `redis`) |
+| `llm_gateway_circuit_store_degraded` | none (1 while the Redis breaker store is unavailable and in-process breakers are used) |
+| `llm_gateway_circuit_store_errors_total` | `op` (`allow`, `success`, `failure`, `release`, `state`) |
 
 Some of the values observed after the quick start:
 
@@ -634,10 +693,14 @@ against the last run on `main`.
 - **Fallback only before the first byte.** Once a client has part of a stream, switching models
   mid-answer would splice two different completions together. So the gateway pulls the first
   chunk inside the retry loop and stops failing over after that.
-- **Circuit breakers per process, per provider.** No coordination is needed, and each replica
-  acts on what it sees. Replicas can briefly disagree. A shared Redis breaker would converge
-  faster but would add a dependency to the hot path. Because a breaker covers a whole provider,
-  repeated failures on one of its models also count against its other models.
+- **Circuit breakers per provider, in-process by default, optionally shared in Redis.** The
+  in-process backend needs no coordination, but with N replicas a failing provider takes N
+  times the failures to trip everywhere and gets N probes. The Redis backend trips it once
+  for all replicas and allows one probe at a time, at the cost of one Redis round trip per
+  provider attempt and per outcome. Redis is kept off the critical path for availability: if
+  it errors or is slow, a replica falls back to in-process breakers rather than failing
+  requests. Because a breaker covers a whole provider, repeated failures on one of its models
+  also count against its other models.
 - **Budget checked before the call, settled after.** Exact pre-flight pricing would need the
   output token count, which isn't known in advance. A request that starts under budget can
   overshoot by its own cost. Under concurrency, every request already in flight when the budget
@@ -690,6 +753,9 @@ TEST_REDIS_URL=redis://localhost:6379/15 .venv/bin/pytest -q
 What the suite covers:
 
 - routing and fallback, retries and backoff, the circuit breaker, timeouts
+- shared breakers: two gateway instances on one Redis seeing the same open state and failure
+  count, a single half-open probe across concurrent callers (and lease expiry), recovery,
+  failed probes, TTL cleanup, falling back when Redis is down or slow, and returning to Redis
 - the cache: normalization, tenant scoping, TTL, streaming replay
 - rate limits (the Lua token bucket) and budgets (enforcement, rebuild from the ledger)
 - token limits: estimate, reserve and settle (refund and charge), concurrent requests not
@@ -707,6 +773,7 @@ No test makes a network call. CI (`.github/workflows/ci.yml`) runs:
 - the suite on SQLite
 - the example eval with a pass-rate gate, and `eval diff` against a second run
 - the suite against Postgres 17 + Redis 7.4, after `alembic upgrade` and `alembic check`
+  (including the shared-breaker tests, against the real Redis)
 
 ## Limitations (v0.1)
 
@@ -731,7 +798,12 @@ No test makes a network call. CI (`.github/workflows/ci.yml`) runs:
   full even if the upstream billed for them.
 - Provider errors (4xx/5xx from upstream) don't carry `x-ratelimit-*` headers.
 - The budget is a soft cap (see the trade-offs above), and budgets are per key, not per tenant.
-- Circuit-breaker state isn't shared across replicas.
+- Circuit breakers are in-process unless `routing.breaker.backend: redis` is set. Shared
+  breakers use each replica's wall clock for the window, cooldown, and lease, so clock skew
+  between replicas shifts those by the skew. During a Redis outage each replica falls back to
+  its own breakers, starting closed, and the state it builds is discarded when Redis returns.
+  `llm_gateway_circuit_state` is per replica, so with `redis` it can lag the shared state on
+  replicas that haven't touched a provider since it changed.
 - The Dockerfile and compose file pass `docker compose config` validation, but this release
   has not been run under Docker. The test suite has been run locally against real Postgres 17
   and Redis 6.2.
@@ -744,7 +816,6 @@ No test makes a network call. CI (`.github/workflows/ci.yml`) runs:
 - Native `/v1/messages` passthrough for Anthropic-specific features
 - Async/batched ledger writes and usage export (CSV / Parquet)
 - Weighted and latency-aware routing, plus per-request routing hints
-- Shared circuit-breaker state in Redis
 - Opt-in semantic cache, per alias
 - Importing eval datasets from the ledger
 - Embeddings endpoint
