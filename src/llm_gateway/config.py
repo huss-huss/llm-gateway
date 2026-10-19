@@ -59,6 +59,10 @@ class CacheConfig(BaseModel):
 
 class LimitsConfig(BaseModel):
     default_rpm: int | None = 600  # applies to keys without their own rate_limit_rpm
+    default_tpm: int | None = None  # applies to keys without their own rate_limit_tpm
+    # Completion tokens reserved against TPM when a request sets no max_tokens
+    # (None: use defaults.max_tokens).
+    completion_token_allowance: int | None = None
 
 
 class Defaults(BaseModel):

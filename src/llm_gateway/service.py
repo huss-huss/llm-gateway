@@ -1,12 +1,12 @@
 """The request pipeline behind ``/v1/chat/completions``.
 
-    resolve route -> rate limit -> budget check -> cache lookup
-      -> call providers (retry/fallback/breaker) -> price -> add spend
-      -> ledger + metrics + log -> cache store
+    resolve route -> request rate limit -> budget check -> cache lookup
+      -> reserve TPM estimate -> call providers (retry/fallback/breaker)
+      -> settle TPM -> price -> add spend -> ledger + metrics + log -> cache store
 
 Every request that passes authentication produces exactly one ledger row, except requests
-rejected by the rate limiter or budget check (those are counted in metrics only, so a client
-hammering the gateway cannot flood the database).
+rejected by the rate limiters or budget check (those are counted in metrics only, so a client
+hammering the gateway cannot flood the database). Cache hits never touch the TPM bucket.
 """
 
 from __future__ import annotations
@@ -28,7 +28,8 @@ from llm_gateway.errors import GatewayHTTPError, error_body
 from llm_gateway.ledger import UsageRecord
 from llm_gateway.observability import metrics
 from llm_gateway.observability.tracing import tracer
-from llm_gateway.providers.base import ProviderError
+from llm_gateway.providers.base import ProviderError, estimate_tokens
+from llm_gateway.ratelimit import TokenReservation, estimate_prompt_tokens
 from llm_gateway.router import AllTargetsFailedError, Attempt, NoRouteError
 from llm_gateway.schemas import (
     ChatCompletionRequest,
@@ -193,13 +194,16 @@ class ChatService:
 
     # ---------------------------------------------------------------- pre-flight
 
+    @staticmethod
+    def _bucket(ctx: AuthContext) -> str:
+        return str(ctx.key_id) if ctx.key_id is not None else f"anon:{ctx.tenant}"
+
     async def _preflight(self, ctx: AuthContext, req: ChatCompletionRequest) -> dict[str, str]:
         """Enforce rate limit and budget before any provider is called."""
         headers: dict[str, str] = {}
         rpm = ctx.rate_limit_rpm or self.state.config.limits.default_rpm
         if rpm:
-            bucket = str(ctx.key_id) if ctx.key_id is not None else f"anon:{ctx.tenant}"
-            decision = await self.state.limiter.hit(bucket, rpm)
+            decision = await self.state.limiter.hit(self._bucket(ctx), rpm)
             headers.update(decision.headers())
             if not decision.allowed:
                 metrics.REJECTIONS.labels("rate_limited").inc()
@@ -223,6 +227,78 @@ class ChatService:
                 )
             headers["x-gateway-budget-remaining-usd"] = f"{remaining:.6f}"
         return headers
+
+    def _completion_allowance(self, req: ChatCompletionRequest) -> int:
+        limits, defaults = self.state.config.limits, self.state.config.defaults
+        return req.effective_max_tokens(limits.completion_token_allowance or defaults.max_tokens)
+
+    async def _reserve_tokens(
+        self, ctx: AuthContext, req: ChatCompletionRequest, headers: dict[str, str], span: Span
+    ) -> TokenReservation | None:
+        """Reserve the request's estimated tokens against the key's TPM bucket (atomic in
+        Redis), or raise 429. Called only once a provider is actually going to be called."""
+        tpm = ctx.rate_limit_tpm or self.state.config.limits.default_tpm
+        if not tpm:
+            return None
+        prompt = estimate_prompt_tokens(req)
+        try:
+            if prompt > tpm:
+                # Could never be admitted, however long the client waits.
+                metrics.REJECTIONS.labels("token_rate_limited").inc()
+                raise GatewayHTTPError(
+                    429,
+                    f"request too large: about {prompt} prompt tokens exceeds this API key's "
+                    f"limit of {tpm} tokens/minute",
+                    "rate_limit_error",
+                    "request_too_large",
+                    {**headers, "x-ratelimit-limit-tokens": str(tpm)},
+                )
+            # A request may always reserve up to the whole bucket, so a large max_tokens
+            # can't lock a key out; settlement charges whatever it really used.
+            cost = min(tpm, prompt + self._completion_allowance(req))
+            bucket = self._bucket(ctx)
+            decision = await self.state.limiter.reserve_tokens(bucket, tpm, cost)
+            if not decision.allowed:
+                metrics.REJECTIONS.labels("token_rate_limited").inc()
+                raise GatewayHTTPError(
+                    429,
+                    f"rate limit of {tpm} tokens/minute exceeded for this API key "
+                    f"(this request needs about {cost})",
+                    "rate_limit_error",
+                    "rate_limit_exceeded",
+                    {**headers, **decision.headers()},
+                )
+        except GatewayHTTPError as err:
+            span.set_attribute("llm_gateway.status", err.code or "rejected")
+            span.set_status(Status(StatusCode.ERROR, err.code or "rejected"))
+            raise
+        headers.update(decision.headers())
+        return TokenReservation(self.state.limiter, bucket, tpm, cost, prompt, decision)
+
+    @staticmethod
+    def _actual_tokens(res: TokenReservation, resp: ProviderResponse | None) -> int:
+        """Tokens to charge: reported usage, else what is known (the prompt estimate plus the
+        output received so far), e.g. when a stream ends early or reports no usage."""
+        if resp is None:
+            return 0
+        if resp.usage.total_tokens:
+            return resp.usage.total_tokens
+        out = (resp.content or "") + "".join(
+            tc["function"]["name"] + tc["function"]["arguments"] for tc in resp.tool_calls
+        )
+        return res.prompt_estimate + estimate_tokens(out)
+
+    async def _settle(
+        self,
+        res: TokenReservation | None,
+        resp: ProviderResponse | None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        if res is None:
+            return
+        decision = await res.settle(self._actual_tokens(res, resp))
+        if headers is not None:
+            headers.update(decision.headers())
 
     async def _begin(
         self,
@@ -302,10 +378,16 @@ class ChatService:
                 return ChatResult(payload, headers)
 
             metrics.CACHE.labels("miss" if key else "bypass").inc()
+            res = await self._reserve_tokens(ctx, req, headers, span)
+            resp: ProviderResponse | None = None
             try:
                 result = await self.state.router.complete(req)
+                resp = result.response
             except (NoRouteError, ProviderError) as exc:
                 raise await self._fail(exc, ctx, req, request_id, started, span) from exc
+            finally:
+                # Failed calls report no usage, so their reservation is refunded in full.
+                await self._settle(res, resp, headers)
 
             cost = self.state.catalog.cost(result.target.id, result.response.usage)
             # Spend must be added before the ledger row is written (see BudgetTracker._ensure).
@@ -351,6 +433,7 @@ class ChatService:
             "chat.completions", attributes=self._span_attrs(ctx, req, request_id)
         )
         token = otel_context.attach(trace.set_span_in_context(span))
+        res: TokenReservation | None = None
         try:
             headers = await self._begin(ctx, req, request_id, started, span)
             key, read = self._cache_key(ctx, req, cache_bypass)
@@ -363,10 +446,14 @@ class ChatService:
                 headers["x-gateway-cache"] = "hit"
             else:
                 metrics.CACHE.labels("miss" if key else "bypass").inc()
+                res = await self._reserve_tokens(ctx, req, headers, span)
                 try:
                     route = await self.state.router.open_stream(req)
-                except (NoRouteError, ProviderError) as exc:
-                    raise await self._fail(exc, ctx, req, request_id, started, span) from exc
+                except BaseException as exc:
+                    await self._settle(res, None)  # nothing was generated: full refund
+                    if isinstance(exc, NoRouteError | ProviderError):
+                        raise await self._fail(exc, ctx, req, request_id, started, span) from exc
+                    raise
                 target, attempts, deltas = route.target, route.attempts, route.deltas
                 headers["x-gateway-cache"] = "miss" if key else "bypass"
         except BaseException:
@@ -411,6 +498,7 @@ class ChatService:
                         hit is not None,
                         status,
                         http_status,
+                        res,
                     )
                 finally:
                     span.end()
@@ -433,6 +521,7 @@ class ChatService:
         cache_hit: bool,
         status: str,
         http_status: int,
+        res: TokenReservation | None = None,
     ) -> None:
         if cache_hit:
             rec = self._record(
@@ -447,6 +536,9 @@ class ChatService:
             )
         else:
             resp = acc.response()
+            # Settles from the final usage chunk; after a disconnect or upstream error, from
+            # what was received (headers are already sent, so the result isn't reported).
+            await self._settle(res, resp)
             cost = self.state.catalog.cost(target.id, resp.usage)
             await self.state.budgets.add(ctx, cost or 0.0)
             rec = self._record(
