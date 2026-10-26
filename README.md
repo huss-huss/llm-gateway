@@ -43,7 +43,7 @@ flowchart LR
     cache -->|miss| router["Router: alias, retries, fallback"]
     router --> breaker["Circuit breakers (LocalBreakers / RedisBreakers)"]
     breaker --> adapters["Provider adapters: OpenAI, Anthropic, Ollama, Fake"]
-    router --> ledger["UsageLedger (Postgres)"]
+    api -->|"after routing (ChatService)"| ledger["UsageLedger (Postgres)"]
     limits -.-> redis[("Redis")]
     budget -.-> redis
     cache -.-> redis
