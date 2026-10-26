@@ -33,6 +33,34 @@ serves it, enforces limits, records cost, and emits traces and metrics.
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    client["Client (OpenAI SDK, curl, services)"] --> api["FastAPI /v1/chat/completions"]
+    api --> auth["Auth: KeyStore (HMAC-SHA256 key hash)"]
+    auth --> limits["RateLimiter: RPM + TPM token buckets"]
+    limits --> budget["BudgetTracker: month-to-date spend"]
+    budget --> cache["ResponseCache (temperature 0, per tenant)"]
+    cache -->|miss| router["Router: alias, retries, fallback"]
+    router --> breaker["Circuit breakers (LocalBreakers / RedisBreakers)"]
+    breaker --> adapters["Provider adapters: OpenAI, Anthropic, Ollama, Fake"]
+    router --> ledger["UsageLedger (Postgres)"]
+    limits -.-> redis[("Redis")]
+    budget -.-> redis
+    cache -.-> redis
+    breaker -.-> redis
+    auth -.-> pg[("Postgres: keys, usage, eval results")]
+    ledger -.-> pg
+    api -.-> obs["OpenTelemetry traces + Prometheus metrics"]
+    evals["EvalRunner (llm-gateway eval)"] --> router
+```
+
+A request is authenticated by `KeyStore`, then checked against Redis-backed RPM/TPM buckets
+(`RateLimiter`) and the key's monthly budget (`BudgetTracker`). Deterministic requests can be
+served from `ResponseCache`; otherwise `Router` resolves the model alias to an ordered list of
+provider targets, retrying and falling back while per-provider circuit breakers (in-process or
+shared via Redis) skip unhealthy upstreams. The priced result is written to the Postgres
+`UsageLedger` and emitted as traces and metrics; `EvalRunner` drives the same `Router` for evals.
+
 ```
                          +--------------------------------------------------------------+
   clients                |  llm-gateway (FastAPI)                                       |
